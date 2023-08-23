@@ -4,6 +4,7 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
+#include <rdma/fi_eq.h>
 
 #include <cassert>
 #include <memory>
@@ -165,37 +166,44 @@ fid_t toFid(const T& in_fabricInterface)
     return &in_fabricInterface.get()->fid;
 }
 
+inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
+                                              const std::string& in_adapterAddress,
+                                              const std::string& in_service,
+                                              bool in_isListener)
+{
+    std::unique_ptr<fi_info> hints{fi_allocinfo()};
+    if (!hints)
+    {
+        throw rdma_error{"hints is null", -FI_ENOMEM};
+    }
+
+    hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+    hints->ep_attr->type = FI_EP_MSG;
+    hints->caps = FI_MSG;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
+    hints->addr_format = FI_SOCKADDR_IN;
+
+    std::shared_ptr<fi_info> fabricInfo;
+    int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), in_adapterAddress.c_str(), in_service.c_str(),
+                         in_isListener ? FI_SOURCE : 0U, hints.get(), makeOutPointer(fabricInfo));
+    if (res != 0)
+    {
+        throw rdma_error{"fi_getinfo", res};
+    }
+
+    return fabricInfo;
+}
+
 struct RdmaAdapter
 {
     std::shared_ptr<fi_info>    _fabricInfo;
     std::shared_ptr<fid_fabric> _fabric;
     std::shared_ptr<fid_domain> _domain;
 
-    RdmaAdapter(const std::string& in_providerName, 
-                const std::string& in_adapterAddress,
-                const std::string& in_service,
-                bool isListener)
+    RdmaAdapter(std::shared_ptr<fi_info> in_fabricInfo)
+        : _fabricInfo{std::move(in_fabricInfo)}
     {
-        std::unique_ptr<fi_info> hints{fi_allocinfo()};
-        if (!hints)
-        {
-            throw std::runtime_error{"hints is null"};
-        }
-
-        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
-        hints->ep_attr->type = FI_EP_MSG;
-        hints->caps = FI_MSG;
-        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-        hints->addr_format = FI_SOCKADDR_IN;
-
-        int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), in_adapterAddress.c_str(), in_service.c_str(),
-                             isListener ? FI_SOURCE : 0U, hints.get(), makeOutPointer(_fabricInfo));
-        if (res != 0)
-        {
-            throw rdma_error{"fi_getinfo", res};
-        }
-
-        res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
+        int res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_fabric", res};
@@ -215,10 +223,9 @@ struct RdmaEndpoint
     std::shared_ptr<fid_domain> _domain;
     std::shared_ptr<fid_fabric> _fabric;
 
-    std::unique_ptr<fid_eq> _eventQueue;
-    std::unique_ptr<fid_cq> _inboundQueue;
-    std::unique_ptr<fid_cq> _outboundQueue;
-    std::unique_ptr<fid_ep> _endpoint;
+    std::unique_ptr<fid_eq>     _eventQueue;
+    std::unique_ptr<fid_cq>     _completionQueue;
+    std::unique_ptr<fid_ep>     _endpoint; // must be before EQ and CQ
 
     RdmaEndpoint(const RdmaAdapter& in_adapter)
         : RdmaEndpoint(in_adapter, *in_adapter._fabricInfo)
@@ -235,47 +242,34 @@ struct RdmaEndpoint
             throw rdma_error{"fi_endpoint", res};
         }
 
-        fi_eq_attr eq_attr = {};
-        eq_attr.wait_obj = FI_WAIT_UNSPEC;
-        eq_attr.flags = FI_WRITE; // We'll insert custom events into EQ
-        res = fi_eq_open(_fabric.get(), &eq_attr, makeOutPointer(_eventQueue), nullptr);
+        fi_eq_attr eqAttrs = {};
+        eqAttrs.wait_obj = FI_WAIT_UNSPEC;
+        res = fi_eq_open(_fabric.get(), &eqAttrs, makeOutPointer(_eventQueue), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_eq_open", res};
         }
 
-        fi_cq_attr cq_attr = {};
-        cq_attr.size = in_fabricInfo.tx_attr->size; // mozna uproscic do 2x tyle co oczekujemy
-        cq_attr.wait_obj = FI_WAIT_UNSPEC;
-        cq_attr.format = FI_CQ_FORMAT_MSG;
-        res = fi_cq_open(_domain.get(), &cq_attr, makeOutPointer(_inboundQueue), nullptr);
+        fi_cq_attr cqAttrs = {};
+        cqAttrs.size = 4; // Derived from the protocol requirements
+                          // (we expect max two completions at given time) times two
+        cqAttrs.wait_obj = FI_WAIT_UNSPEC;
+        cqAttrs.format = FI_CQ_FORMAT_MSG;
+        res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_cq_open", res};
         }
-
-        res = fi_cq_open(_domain.get(), &cq_attr, makeOutPointer(_outboundQueue), nullptr);
-        if (res != 0)
-        {
-            throw rdma_error{"fi_cq_open", res};
-        }
-
+    
         res = fi_ep_bind(_endpoint.get(), toFid(_eventQueue), 0);
         if (res != 0)
         {
-            throw rdma_error{"fi_ep_bind 1", res};
+            throw rdma_error{"fi_ep_bind to EQ", res};
         }
-
-        res = fi_ep_bind(_endpoint.get(), toFid(_inboundQueue), FI_RECV);
+        res = fi_ep_bind(_endpoint.get(), toFid(_completionQueue), FI_RECV | FI_SEND);
         if (res != 0)
         {
-            throw rdma_error{"fi_ep_bind 2", res};
-        }
-
-        res = fi_ep_bind(_endpoint.get(), toFid(_outboundQueue), FI_SEND);
-        if (res != 0)
-        {
-            throw rdma_error{"fi_ep_bind 3", res};
+            throw rdma_error{"fi_ep_bind to CQ", res};
         }
     }
 
@@ -315,8 +309,8 @@ struct RdmaListeningEndpoint
 {
     std::shared_ptr<fid_fabric> _fabric;
 
-    std::unique_ptr<fid_eq> _eventQueue;
-    std::unique_ptr<fid_pep> _passiveEndpoint;
+    std::unique_ptr<fid_eq>  _eventQueue;
+    std::unique_ptr<fid_pep> _passiveEndpoint; // must be before EQ
 
     RdmaListeningEndpoint(const RdmaAdapter& in_adapter)
         : _fabric{in_adapter._fabric}
@@ -341,20 +335,6 @@ struct RdmaListeningEndpoint
         {
             throw rdma_error{"fi_pep_bind", res};
         }
-
-        /*
-        sockaddr_in boundAddr;
-        size_t boundAddrLen = sizeof(boundAddr);
-        res = fi_getname(reinterpret_cast<fid_t>(listeningEndpoint._passiveEndpoint.get()), &boundAddr, &boundAddrLen);
-        if (res != 0)
-        {
-            throw rdma_error{"fi_getname", res};
-        }
-        if (ntohs(boundAddr.sin_port) != atoi(in_cfg.port.c_str()))
-        {
-            throw std::runtime_error{"bad port given"};
-        }
-        */
 
         res = fi_listen(_passiveEndpoint.get());
         if (res != 0)

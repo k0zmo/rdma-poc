@@ -6,18 +6,19 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
+#include <rdma/fi_eq.h>
 
 #ifdef _WIN32
 #  include <winerror.h>
 #endif
 
+#include <chrono>
 #include <cstring>
 #include <cstdint>
 #include <string>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
-#include <thread>
 
 struct AppOptions
 {
@@ -28,70 +29,127 @@ struct AppOptions
 
 bool quit = false;
 
+enum class WaitResult
+{
+    GOT_MESSAGE,
+    ERROR,
+    SHUTDOWN,
+    TIMEOUT
+};
+
 void handleConnected(RdmaEndpoint& in_endpoint)
 {
-    constexpr auto bufSize = 1024 * 1024; // 1 MB
+    constexpr auto bufSize = 5 * 1024 * 1024; // 1 MB
     static uint64_t key = 1;
     std::unique_ptr<char[]> buf = std::make_unique<char[]>(bufSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_RECV, 0, key++, 0, makeOutPointer(memoryRegion), nullptr);
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_RECV, 0, key++, 0,
+                        makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
         throw rdma_error{"fi_mr_reg", res};
     }
 
+    int numMessagesReceived = 0;
+
+    uint32_t event = 0;
+    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize();
+    std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
+    fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
+
     while (true)
     {
         //std::cin.get();
+
         std::cout << "Signaling to sender we're ready to receive new message\n";
-        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()), FI_ADDR_UNSPEC, nullptr);
-        if (res != 0)
+        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()),
+                              FI_ADDR_UNSPEC, nullptr);
+        if (ret != 0)
         {
-            throw rdma_error{"fi_recv", static_cast<int>(res)};
+            throw rdma_error{"fi_recv", static_cast<int>(ret)};
         }
         in_endpoint.sendEmptyMessage();
 
+        const auto waitingStart = std::chrono::steady_clock::now();
+        WaitResult waitResult = WaitResult::TIMEOUT;
+        
+        fi_cq_msg_entry entry;
+        while(std::chrono::steady_clock::now() - waitingStart < std::chrono::seconds{5})
         {
-            fi_cq_entry entry;
-            while(1)
+            // Or after fi_cq_read?
+            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
+            if (ret > 0)
             {
-                ret = fi_cq_read(in_endpoint._inboundQueue.get(), &entry, 1);
-                if (ret != -FI_EAGAIN)
+                if (event == FI_SHUTDOWN)
                 {
-                    //std::cout << "cq_read from inbound queue: " << ret << '\n';
+                    std::cout << "Received SHUTDOWN from the peer\n";
+                    waitResult = WaitResult::SHUTDOWN;
                     break;
                 }
             }
-        }
-
-        std::cout << "Got message from the sender: " << +buf[1] << std::endl;
-
-        if (buf[0] == 2)
+            else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
         {
-            //quit = true;
+                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
+                waitResult = WaitResult::ERROR;
             break;
         }
 
-        {
-            fi_cq_entry entry;
-            while(1)
+            ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
+            if (ret != -FI_EAGAIN)
             {
-                ret = fi_cq_read(in_endpoint._outboundQueue.get(), &entry, 1);
-                if (ret != -FI_EAGAIN)
+                //std::cout << "CQ: got " << entry.flags << std::endl;
+                if ((entry.flags & (FI_RECV | FI_MSG)) == (FI_RECV | FI_MSG))
                 {
-                    //std::cout << "cq_read from outbound queue: " << ret << '\n';
+                    waitResult = WaitResult::GOT_MESSAGE;
                     break;
                 }
             }
+            else if (ret == -FI_EAVAIL)
+            {
+                fi_cq_err_entry err{};
+                fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
+                if (err.err_data_size > 0)
+                {
+                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
+                    std::cout << "Error on CQ: " << errorMessage << std::endl;
+                }
+                else
+                {
+                    std::cout << "Error on CQ ?!" << std::endl;
+                }
+                waitResult = WaitResult::ERROR;
+                break;
+            }
+        }
+
+        if (waitResult != WaitResult::GOT_MESSAGE)
+        {
+            if (waitResult == WaitResult::TIMEOUT)
+            {
+                std::cout << "Timeout receiving a message from sender\n";
+            }
+            quit = true;
+            break;
+        }
+
+        std::cout << "  Got " << numMessagesReceived << " message from the sender: " << entry.len << std::endl;
+
+        if (++numMessagesReceived > 10)
+        {
+            fi_shutdown(in_endpoint._endpoint.get(), 0);
+            quit = true;
+            break;
         }
     }
 
-    fi_shutdown(in_endpoint._endpoint.get(), 0);
+    //crashes on vrb_ep_close?!
+    //fi_shutdown(in_endpoint._endpoint.get(), 0);
 }
 
 void run(const AppOptions& in_cfg)
 {
-    RdmaAdapter adapter{in_cfg.providerName, in_cfg.address, in_cfg.port, false};
+    auto fabricInfo = getFabricInfo(in_cfg.providerName, in_cfg.address, in_cfg.port, false);
+    RdmaAdapter adapter{std::move(fabricInfo)};
 
     // Start of receiver specific
     RdmaEndpoint ep{adapter};
@@ -116,7 +174,7 @@ void run(const AppOptions& in_cfg)
     clientData._flowIdentifier[13] = 0x15;
     clientData._flowIdentifier[14] = 0x8b;
     clientData._flowIdentifier[15] = 0xd4;
-    int res = fi_connect(ep._endpoint.get(), &adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
+    int res = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
     if (res != 0)
     {
         throw rdma_error{"fi_connect", res};
@@ -127,21 +185,15 @@ void run(const AppOptions& in_cfg)
     fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
     uint32_t event = 0;
 
-    std::thread th;
-
     while (!quit)
     {
-        const auto eq = ep._eventQueue.get();
-
-        // timeout trzeba dac jakis sensowny
-        // dla verbsow nie dostajemy zadnego sygnalu
-        const ssize_t rd = fi_eq_sread(eq, &event, entry, maxEntrySize, -1, 0);
+        const ssize_t rd = fi_eq_sread(ep._eventQueue.get(), &event, entry, maxEntrySize, -1, 0);
         if (rd < 0)
         {
             if (rd == -FI_EAVAIL)
             {
-                fi_eq_err_entry err;
-                fi_eq_readerr(eq, &err, 0);
+                fi_eq_err_entry err{};
+                fi_eq_readerr(ep._eventQueue.get(), &err, 0);
                 if (err.err == FI_ECONNREFUSED
 #ifdef _WIN32
                  || err.err == WSAECONNREFUSED
@@ -163,7 +215,7 @@ void run(const AppOptions& in_cfg)
                     std::cout << "Error while trying to establish a connection: " << fi_strerror(err.err) << std::endl;
                 }
             }
-            std::cout << "Error calling fi_eq_read(): " << rd << std::endl;
+            std::cout << "Error calling fi_eq_sread(): " << rd << std::endl;
             break;
         }
         if (event == FI_SHUTDOWN)
@@ -189,19 +241,13 @@ void run(const AppOptions& in_cfg)
         ServerConnectionFlowV1B serverData;
         memcpy(&serverData, entry->data, connectionDataSize);
         std::cout << "Connection data:"
-                  << "\nframeMetadataSize: " << serverData._frameMetadataSize
-                  << "\nframeSize: " << serverData._frameSize
-                  << "\nacceptConnectionTime: " << serverData._acceptConnectionTime
-                  << "\nhasActiveProducers: " << serverData._hasActiveProducers << std::endl;
+                  << "\n  frameMetadataSize: " << serverData._frameMetadataSize
+                  << "\n  frameSize: " << serverData._frameSize
+                  << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
+                  << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
 
-        //std::thread th1{[&] {
             handleConnected(ep);
-        //}};
-        //th.swap(th1);
     }
-
-    if (th.joinable())
-        th.join();
 }
 
 int main(int argc, char* argv[])
