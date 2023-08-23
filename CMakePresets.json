@@ -27,6 +27,9 @@
             "hidden": true,
             "inherits": "base",
             "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "cacheVariables": {
+                "libfabric_ROOT": "/opt/libfabric"
+            },
             "vendor": {
                 "microsoft.com/VisualStudioRemoteSettings/CMake/1.0": {
                     "sourceDir": "$env{HOME}/.vs/$ms{projectDirName}",

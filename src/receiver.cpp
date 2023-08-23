@@ -21,7 +21,7 @@
 
 struct AppOptions
 {
-    std::string address{" 172.19.41.49"};
+    std::string address{"192.168.110.8"};
     std::string port{"8001"};
     std::string providerName{"verbs"};
 };
@@ -42,7 +42,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
     while (true)
     {
-        std::cin.get();
+        //std::cin.get();
         std::cout << "Signaling to sender we're ready to receive new message\n";
         ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()), FI_ADDR_UNSPEC, nullptr);
         if (res != 0)
@@ -91,56 +91,10 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
 void run(const AppOptions& in_cfg)
 {
-    std::unique_ptr<fi_info> hints{fi_allocinfo()};
-    if (!hints)
-    {
-        throw std::runtime_error{"hints is null"};
-    }
-
-    hints->fabric_attr->prov_name = strdup(in_cfg.providerName.c_str());
-    hints->ep_attr->type = FI_EP_MSG;
-    hints->caps = FI_MSG;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-
-    const char* node = in_cfg.address.c_str();
-    const char* service = in_cfg.port.c_str();
-    const uint64_t flags = 0;
-
-    std::unique_ptr<fi_info> fabricInfo;
-    int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), node, service, flags, hints.get(),
-                         makeOutPointer(fabricInfo));
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getinfo", res};
-    }
-
-    // Fabric + Domain + event queue = "shared resources"
-
-    std::shared_ptr<fid_fabric> fabric;
-    res = fi_fabric(fabricInfo->fabric_attr, makeOutPointerForFI(fabric), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_fabric", res};
-    }
-
-    std::shared_ptr<fid_domain> domain;
-    res = fi_domain(fabric.get(), fabricInfo.get(), makeOutPointerForFI(domain), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_domain", res};
-    }
-
-    std::shared_ptr<fid_eq> eventQueue; // For connection management (slow-path)
-    fi_eq_attr eq_attr = {};
-    eq_attr.wait_obj = FI_WAIT_UNSPEC;
-    res = fi_eq_open(fabric.get(), &eq_attr, makeOutPointerForFI(eventQueue), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_eq_open", res};
-    }
+    RdmaAdapter adapter{in_cfg.providerName, in_cfg.address, in_cfg.port, false};
 
     // Start of receiver specific
-    RdmaEndpoint ep{domain, eventQueue, *fabricInfo};
+    RdmaEndpoint ep{adapter};
 
     ClientConnectionFlowV1B clientData;
     clientData._wantsFrameMetadata = false;
@@ -162,21 +116,14 @@ void run(const AppOptions& in_cfg)
     clientData._flowIdentifier[13] = 0x15;
     clientData._flowIdentifier[14] = 0x8b;
     clientData._flowIdentifier[15] = 0xd4;
-    res = fi_connect(ep._endpoint.get(), fabricInfo->dest_addr, &clientData, sizeof(clientData));
+    int res = fi_connect(ep._endpoint.get(), &adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
     if (res != 0)
     {
         throw rdma_error{"fi_connect", res};
     }
 
-    size_t maxConnectionDataSize = 0, maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
-    res = fi_getopt(reinterpret_cast<fid_t>(ep._endpoint.get()), FI_OPT_ENDPOINT,
-                    FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getopt", res};
-    }
-
-    std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(maxConnectionDataSize);
+    const auto maxEntrySize = ep.getMaxConnectionDataSize();
+    std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(maxEntrySize);
     fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
     uint32_t event = 0;
 
@@ -184,38 +131,44 @@ void run(const AppOptions& in_cfg)
 
     while (!quit)
     {
+        const auto eq = ep._eventQueue.get();
+
         // timeout trzeba dac jakis sensowny
         // dla verbsow nie dostajemy zadnego sygnalu
-        const ssize_t rd = fi_eq_sread(eventQueue.get(), &event, entry, maxConnectionDataSize, -1, 0);
-        if (rd == -FI_EAVAIL)
+        const ssize_t rd = fi_eq_sread(eq, &event, entry, maxEntrySize, -1, 0);
+        if (rd < 0)
         {
-            fi_eq_err_entry err;
-            fi_eq_readerr(eventQueue.get(), &err, 0);
-            if (err.err == FI_ECONNREFUSED
-#ifdef _WIN32
-             || err.err == WSAECONNREFUSED
-#endif
-)
+            if (rd == -FI_EAVAIL)
             {
-                if (err.err_data_size > 0)
+                fi_eq_err_entry err;
+                fi_eq_readerr(eq, &err, 0);
+                if (err.err == FI_ECONNREFUSED
+#ifdef _WIN32
+                 || err.err == WSAECONNREFUSED
+#endif
+                )
                 {
-                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                    std::cout << "Connection refused, reason: " << errorMessage << std::endl;
+                    if (err.err_data_size > 0)
+                    {
+                        std::string errorMessage{(const char*)err.err_data, err.err_data_size};
+                        std::cout << "Connection refused, reason: " << errorMessage << std::endl;
+                    }
+                    else
+                    {
+                        std::cout << "Connection refused, unknown reason." << std::endl;
+                    }
                 }
                 else
                 {
-                    std::cout << "Connection refused, unknown reason." << std::endl;
+                    std::cout << "Error while trying to establish a connection: " << fi_strerror(err.err) << std::endl;
                 }
             }
-            else
-            {
-                std::cout << "Error while trying to establish a connection: " << fi_strerror(err.err) << std::endl;
-            }
+            std::cout << "Error calling fi_eq_read(): " << rd << std::endl;
             break;
         }
         if (event == FI_SHUTDOWN)
         {
-            std::cout << "Shutdown processed.\n";
+            std::cout << "Shutdown received - quitting.\n";
             break;
         }
         if (event != FI_CONNECTED || entry->fid != &ep._endpoint->fid)
@@ -224,7 +177,7 @@ void run(const AppOptions& in_cfg)
             continue;
         }
         std::unique_ptr<fi_info> entryRaii{entry->info};
-        if (rd < (ssize_t)sizeof(*entry))
+        if (static_cast<size_t>(rd) < sizeof(*entry))
         {
             std::cout << "Unexpected size of connection data: " << rd << std::endl;
             continue;

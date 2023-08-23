@@ -2,7 +2,6 @@
 #include "rdma_types.h"
 #include "getopt.h"
 
-#include <netinet/in.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -11,7 +10,7 @@
 #include <rdma/fi_errno.h>
 
 #ifndef _WIN32
-#  include <arpa/inet.h>
+#  include <netinet/ip.h>
 #endif
 
 #include <cassert>
@@ -21,15 +20,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <thread>
-
-struct AppOptions
-{
-    std::string address{" 172.19.41.49"};
-    std::string port{"8001"};
-    std::string providerName{"verbs"};
-};
+#include <vector>
 
 // For TCP proviver:
 //  - trzeba zawolac fi_eq_sread z krotkim timeoutem na samym poczatku (najlepiej bez zadnych zrodel)
@@ -38,6 +30,13 @@ struct AppOptions
 //  - poll() potrafi zwrocic, po czym fi_eq_read zwraca EAGAIN i nastepny poll() jest juz OK
 // For verbs/ndirect
 //  - Przez to ze epoll'a nie ma na windowsie nie mozemy w ogole dostac FI_GETOBJ
+
+struct AppOptions
+{
+    std::string address{"192.168.110.8"};
+    std::string port{"8001"};
+    std::string providerName{"verbs"};
+};
 
 void handleConnection(RdmaEndpoint& in_endpoint)
 {
@@ -53,6 +52,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         throw rdma_error{"fi_mr_reg", res};
     }
 
+    // Normally, fi_accept calls fi_enable but we want to post receive before doing so.
     fi_enable(in_endpoint._endpoint.get());
 
     in_endpoint.receiveEmptyMessage();
@@ -67,6 +67,13 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     {
         throw rdma_error{"fi_accept", res};
     }
+
+    std::cout << "Waiting on connected event";
+    uint32_t event;
+    char eventBuf[128];
+    fi_eq_sread(in_endpoint._eventQueue.get(), &event, eventBuf, sizeof(eventBuf), -1, 0U);
+    assert(event == FI_CONNECTED);
+    std::cout << " CONNECTED\n";
 
     // recv przed loop
     // loop:
@@ -153,6 +160,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
                     {
                         std::cout << "Error on CQ ?!" << std::endl;
                     }
+                    return;
                 }
                 else if (ret != -FI_EAGAIN)
                 {
@@ -173,101 +181,13 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
 void run(const AppOptions& in_cfg)
 {
-    std::unique_ptr<fi_info> hints{fi_allocinfo()};
-    if (!hints)
-    {
-        throw std::runtime_error{"hints is null"};
-    }
+    RdmaAdapter adapter{in_cfg.providerName, in_cfg.address, in_cfg.port, true};
+    RdmaListeningEndpoint listeningEndpoint{adapter};
 
-    hints->fabric_attr->prov_name = strdup(in_cfg.providerName.c_str());
-    hints->ep_attr->type = FI_EP_MSG;
-    hints->caps = FI_MSG;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-    // Force IPv4
-    hints->src_addrlen = sizeof(sockaddr_in);
-
-    const char* node = in_cfg.address.c_str();
-    const char* service = in_cfg.port.c_str();
-    const uint64_t flags = FI_SOURCE;
-
-    std::unique_ptr<fi_info> fabricInfo;
-    int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), node, service, flags, hints.get(),
-                         makeOutPointer(fabricInfo));
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getinfo", res};
-    }
-
-    // Fabric + Domain + event queue = "shared resources"
-
-    std::shared_ptr<fid_fabric> fabric;
-    res = fi_fabric(fabricInfo->fabric_attr, makeOutPointerForFI(fabric), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_fabric", res};
-    }
-
-    std::shared_ptr<fid_domain> domain;
-    res = fi_domain(fabric.get(), fabricInfo.get(), makeOutPointerForFI(domain), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_domain", res};
-    }
-
-    std::shared_ptr<fid_eq> eventQueue;
-    fi_eq_attr eq_attr = {};
-    eq_attr.wait_obj = FI_WAIT_POLLFD;
-    eq_attr.flags = FI_WRITE; // We'll insert custom events into EQ
-    res = fi_eq_open(fabric.get(), &eq_attr, makeOutPointerForFI(eventQueue), nullptr);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_eq_open", res};
-    }
-
-// HACK allow EQ's pollset to be initialized (it adds fd's lazily on first call to fi_eq_sread)
-    uint32_t e;
-    char buf[128];
-    res = fi_eq_sread(eventQueue.get(), &e, buf, sizeof(buf), 1, 0);
-
-    RdmaListeningEndpoint listeningEndpoint{fabric, eventQueue, *fabricInfo};
-
-    sockaddr_in boundAddr;
-    size_t boundAddrLen = sizeof(boundAddr);
-    res = fi_getname(reinterpret_cast<fid_t>(listeningEndpoint._passiveEndpoint.get()), &boundAddr, &boundAddrLen);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getname", res};
-    }
-
-    if (ntohs(boundAddr.sin_port) != atoi(in_cfg.port.c_str()))
-    {
-        throw std::runtime_error{"bad port given"};
-    }
-
-    size_t maxConnectionDataSize = 0, maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
-    res = fi_getopt(reinterpret_cast<fid_t>(listeningEndpoint._passiveEndpoint.get()), FI_OPT_ENDPOINT,
-                    FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getopt", res};
-    }
-
-    std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(maxConnectionDataSize);
+    const auto entryMaxSize = listeningEndpoint.getMaxConnectionDataSize();
+    std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(entryMaxSize);
     fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
     uint32_t event = 0;
-
-    fi_wait_pollfd pollfd{};
-    res = fi_control((fid_t) eventQueue.get(), FI_GETWAIT, &pollfd);
-    if (res != -FI_ETOOSMALL)
-    {
-        throw rdma_error{"fi_getopt", res};
-    }
-    pollfd.fd = new struct pollfd[pollfd.nfds];
-    res = fi_control((fid_t) eventQueue.get(), FI_GETWAIT, &pollfd);
-    if (res != 0)
-    {
-        throw rdma_error{"fi_getopt", res};
-    }
 
     //std::thread th{[&]() {
         //std::this_thread::sleep_for(std::chrono::seconds{10});
@@ -277,75 +197,56 @@ void run(const AppOptions& in_cfg)
     //}};
     //th.detach();
 
-    std::cout << "change index: " << pollfd.change_index << '\n';
-
     while (true)
     {
-        //std::cout << "    calling fi_eq_read()\n";
-        //const ssize_t rd = fi_eq_sread(eventQueue.get(), &event, entry, maxConnectionDataSize, -1, 0);
-        //std::cout << "    eq_read: " << rd << ", event: " << event << std::endl;
-
-        fid_t fids[] = { (fid_t) eventQueue.get() };
-        res = fi_trywait(fabric.get(), fids, std::size(fids));
-
-        if (res == FI_SUCCESS)
-        {
-            // HACK: for tcp provider first descriptor is unsignalled only during fi_eq_sread call
-            // Calling fi_eq_read only will make it stay signalled all the time. 
-            struct pollfd* fd = in_cfg.providerName == "tcp" ? pollfd.fd + 1 : pollfd.fd;
-            size_t ndfs =  in_cfg.providerName == "tcp" ? pollfd.nfds - 1 : pollfd.nfds;
-            int c = poll(fd, ndfs, -1);
-            std::cout << "Events: " << c << '\n';
-        }
-
-        // timeout trzeba dac jakis sensowny
-        // dla verbsow nie dostajemy zadnego sygnalu
-        std::cout << "    calling fi_eq_read()\n";
-        event = 999;
-        const ssize_t rd = fi_eq_read(eventQueue.get(), &event, entry, maxConnectionDataSize, 0);
-        std::cout << "    eq_read: " << rd << ", event: " << event << std::endl;
+        const auto eq = listeningEndpoint._eventQueue.get();
+        std::cout << "    calling fi_eq_sread()\n";
+        const ssize_t rd = fi_eq_sread(eq, &event, entry, entryMaxSize, -1, 0);
+        std::cout << "    eq_sread: " << rd << ", event: " << event << std::endl;
 
         if (rd == -FI_EAGAIN)
         {
             continue;
         }
-        
-        fi_wait_pollfd test{};
-        res = fi_control((fid_t) eventQueue.get(), FI_GETWAIT, &test);
-        std::cout << "change index: " << test.change_index << '\n';
-
-        if (test.change_index != pollfd.change_index)
+        if (rd < 0)
         {
-            delete[] pollfd.fd;
-            pollfd.nfds = test.nfds;
-            pollfd.fd = new struct pollfd[pollfd.nfds];
-            res = fi_control((fid_t) eventQueue.get(), FI_GETWAIT, &pollfd);
-            assert(res == 0);
-        }
-        // delete[] pollfd.fd;
-        // pollfd.fd = new struct pollfd[pollfd.nfds];
-        // res = fi_control((fid_t) eventQueue.get(), FI_GETWAIT, &pollfd);
-        // if (res != 0)
-        // {
-        //     throw rdma_error{"fi_getopt", res};
-        // }
-
-        // assert(rd > 0);
-        
-        if (event == FI_CONNECTED)
-        {
-            // Ignore an event that's generated when we (passive side) accept incoming connection
-            // DONT DO THIS - we can only "start" connection after this event is fired
-            // but it's only fired after fi_accept!
+            if (rd == -FI_EAVAIL)
+            {
+                fi_eq_err_entry err;
+                fi_eq_readerr(eq, &err, 0);
+                if (err.err_data_size > 0)
+                {
+                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
+                    std::cout << "Error calling fi_eq_read(): " << errorMessage << std::endl;
+                }
+                else
+                {
+                    std::cout << "Error calling fi_eq_read(), unknown reason" << rd << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "Error calling fi_eq_read(): " << rd << std::endl;
+            }
             continue;
         }
+        // if (event == FI_CONNECTED)
+        // {
+        //     std::cout << "EQ: Endpoint connected\n";
+        //     continue;
+        // }
+        // if (event == FI_SHUTDOWN)
+        // {
+        //     std::cout << "EQ: Endpoint shutdown\n";
+        //     continue;
+        // }
         if (event != FI_CONNREQ)
         {
-            std::cout << "Unexpected event: " << event << std::endl;
+            std::cout << "EQ: Unexpected event - " << event << std::endl;
             continue;
         }
         std::unique_ptr<fi_info> entryRaii{entry->info};
-        if ((size_t)rd < sizeof(*entry))
+        if (static_cast<size_t>(rd) < sizeof(*entry))
         {
             std::cout << "Unexpected size of connection data: " << rd << std::endl;
             continue;
@@ -364,7 +265,7 @@ void run(const AppOptions& in_cfg)
             {
                 if (connectionDataSize >= sizeof(ClientConnectionFlowV1))
                 {
-                    ClientConnectionFlowV1B clientConnectionV1;
+                    ClientConnectionFlowV1B clientConnectionV1{};
                     if (connectionDataSize >= sizeof(ClientConnectionFlowV1B))
                     {
                         std::memcpy(&clientConnectionV1, entry->data, sizeof(ClientConnectionFlowV1B));
@@ -407,7 +308,7 @@ void run(const AppOptions& in_cfg)
                               << "\nFlow identifier: " << ss.str()
                               << "\nWants metadata: " << std::boolalpha << clientConnectionV1._wantsFrameMetadata << std::endl;
 
-                    RdmaEndpoint ep{domain, eventQueue, *entry->info};
+                    RdmaEndpoint ep{adapter, *entry->info};
 
                     std::thread th{[ep = std::move(ep)]() mutable -> void {
                         handleConnection(ep);
@@ -486,7 +387,7 @@ int main(int argc, char* argv[])
             ss << fi->fabric_attr->prov_name;
         }
         std::cout << "Compiled providers: " << ss.rdbuf() << std::endl;
-
+        
         run(options);
     }
     catch (const std::exception& ex)

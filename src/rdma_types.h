@@ -136,10 +136,9 @@ makeOutPointer(SmartPointer& inout_pointer, Deleter in_deleter)
 
 template <typename T>
 auto
-makeOutPointerForFI(std::shared_ptr<T>& inout_pointer)
+makeOutPointer(std::shared_ptr<T>& inout_pointer)
 {
-    return OutPointerWithDynamicDeleter<std::shared_ptr<T>, FabricInterfaceDeleter<T>>(
-        inout_pointer, FabricInterfaceDeleter<T>{});
+    return makeOutPointer(inout_pointer, FabricInterfaceDeleter<T>{});
 }
 
 struct rdma_error : std::runtime_error
@@ -160,25 +159,89 @@ private:
     }
 };
 
+template <typename T>
+fid_t toFid(const T& in_fabricInterface)
+{
+    return &in_fabricInterface.get()->fid;
+}
+
+struct RdmaAdapter
+{
+    std::shared_ptr<fi_info>    _fabricInfo;
+    std::shared_ptr<fid_fabric> _fabric;
+    std::shared_ptr<fid_domain> _domain;
+
+    RdmaAdapter(const std::string& in_providerName, 
+                const std::string& in_adapterAddress,
+                const std::string& in_service,
+                bool isListener)
+    {
+        std::unique_ptr<fi_info> hints{fi_allocinfo()};
+        if (!hints)
+        {
+            throw std::runtime_error{"hints is null"};
+        }
+
+        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+        hints->ep_attr->type = FI_EP_MSG;
+        hints->caps = FI_MSG;
+        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
+        hints->addr_format = FI_SOCKADDR_IN;
+
+        int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), in_adapterAddress.c_str(), in_service.c_str(),
+                             isListener ? FI_SOURCE : 0U, hints.get(), makeOutPointer(_fabricInfo));
+        if (res != 0)
+        {
+            throw rdma_error{"fi_getinfo", res};
+        }
+
+        res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_fabric", res};
+        }
+
+        std::shared_ptr<fid_domain> domain;
+        res = fi_domain(_fabric.get(), _fabricInfo.get(), makeOutPointer(_domain), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_domain", res};
+        }
+    }
+};
+
 struct RdmaEndpoint
 {
     std::shared_ptr<fid_domain> _domain;
-    std::shared_ptr<fid_eq> _eventQueueCM;
+    std::shared_ptr<fid_fabric> _fabric;
 
+    std::unique_ptr<fid_eq> _eventQueue;
     std::unique_ptr<fid_cq> _inboundQueue;
     std::unique_ptr<fid_cq> _outboundQueue;
     std::unique_ptr<fid_ep> _endpoint;
 
-    RdmaEndpoint(std::shared_ptr<fid_domain> in_domain,
-                 std::shared_ptr<fid_eq> in_eventQueueCM,
-                 const fi_info& in_fabricInfo)
-        : _domain{std::move(in_domain)}
-        , _eventQueueCM{std::move(in_eventQueueCM)}
+    RdmaEndpoint(const RdmaAdapter& in_adapter)
+        : RdmaEndpoint(in_adapter, *in_adapter._fabricInfo)
+    {
+    }
+
+    RdmaEndpoint(const RdmaAdapter& in_adapter, const fi_info& in_fabricInfo)
+        : _domain{in_adapter._domain}
+        , _fabric{in_adapter._fabric}
     {
         int res = fi_endpoint(_domain.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_endpoint), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_endpoint", res};
+        }
+
+        fi_eq_attr eq_attr = {};
+        eq_attr.wait_obj = FI_WAIT_UNSPEC;
+        eq_attr.flags = FI_WRITE; // We'll insert custom events into EQ
+        res = fi_eq_open(_fabric.get(), &eq_attr, makeOutPointer(_eventQueue), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_eq_open", res};
         }
 
         fi_cq_attr cq_attr = {};
@@ -197,22 +260,22 @@ struct RdmaEndpoint
             throw rdma_error{"fi_cq_open", res};
         }
 
-        res = fi_ep_bind(_endpoint.get(), reinterpret_cast<fid_t>(_inboundQueue.get()), FI_RECV);
+        res = fi_ep_bind(_endpoint.get(), toFid(_eventQueue), 0);
         if (res != 0)
         {
-            throw rdma_error{"fi_ep_bind", res};
+            throw rdma_error{"fi_ep_bind 1", res};
         }
 
-        res = fi_ep_bind(_endpoint.get(), reinterpret_cast<fid_t>(_outboundQueue.get()), FI_SEND);
+        res = fi_ep_bind(_endpoint.get(), toFid(_inboundQueue), FI_RECV);
         if (res != 0)
         {
-            throw rdma_error{"fi_ep_bind", res};
+            throw rdma_error{"fi_ep_bind 2", res};
         }
 
-        res = fi_ep_bind(_endpoint.get(), reinterpret_cast<fid_t>(_eventQueueCM.get()), 0);
+        res = fi_ep_bind(_endpoint.get(), toFid(_outboundQueue), FI_SEND);
         if (res != 0)
         {
-            throw rdma_error{"fi_ep_bind", res};
+            throw rdma_error{"fi_ep_bind 3", res};
         }
     }
 
@@ -233,37 +296,83 @@ struct RdmaEndpoint
             throw rdma_error{"fi_send", static_cast<int>(res)};
         }
     }
+
+    size_t getMaxConnectionDataSize() const
+    {
+        size_t maxConnectionDataSize = 0;
+        size_t maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
+        int res = fi_getopt(toFid(_endpoint), FI_OPT_ENDPOINT,
+                            FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_getopt", res};
+        }
+        return maxConnectionDataSize;
+    }
 };
 
 struct RdmaListeningEndpoint
 {
     std::shared_ptr<fid_fabric> _fabric;
-    std::shared_ptr<fid_eq> _eventQueueCM;
 
+    std::unique_ptr<fid_eq> _eventQueue;
     std::unique_ptr<fid_pep> _passiveEndpoint;
 
-    RdmaListeningEndpoint(std::shared_ptr<fid_fabric> in_fabric,
-                          std::shared_ptr<fid_eq> in_eventQueueCM,
-                          const fi_info& in_fabricInfo)
-        : _fabric{std::move(in_fabric)}
-        , _eventQueueCM{std::move(in_eventQueueCM)}
+    RdmaListeningEndpoint(const RdmaAdapter& in_adapter)
+        : _fabric{in_adapter._fabric}
     {
-        int res = fi_passive_ep(_fabric.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_passiveEndpoint), nullptr);
+        int res = fi_passive_ep(_fabric.get(), in_adapter._fabricInfo.get(), makeOutPointer(_passiveEndpoint), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_passive_ep", res};
         }
 
-        res = fi_pep_bind(_passiveEndpoint.get(), reinterpret_cast<fid_t>(_eventQueueCM.get()), 0);
+        fi_eq_attr eq_attr = {};
+        eq_attr.wait_obj = FI_WAIT_UNSPEC;
+        eq_attr.flags = FI_WRITE; // We'll insert custom events into EQ
+        res = fi_eq_open(_fabric.get(), &eq_attr, makeOutPointer(_eventQueue), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_eq_open", res};
+        }
+
+        res = fi_pep_bind(_passiveEndpoint.get(), toFid(_eventQueue), 0);
         if (res != 0)
         {
             throw rdma_error{"fi_pep_bind", res};
         }
+
+        /*
+        sockaddr_in boundAddr;
+        size_t boundAddrLen = sizeof(boundAddr);
+        res = fi_getname(reinterpret_cast<fid_t>(listeningEndpoint._passiveEndpoint.get()), &boundAddr, &boundAddrLen);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_getname", res};
+        }
+        if (ntohs(boundAddr.sin_port) != atoi(in_cfg.port.c_str()))
+        {
+            throw std::runtime_error{"bad port given"};
+        }
+        */
 
         res = fi_listen(_passiveEndpoint.get());
         if (res != 0)
         {
             throw rdma_error{"fi_listen", res};
         }
+    }
+
+    size_t getMaxConnectionDataSize() const
+    {
+        size_t maxConnectionDataSize = 0;
+        size_t maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
+        int res = fi_getopt(toFid(_passiveEndpoint), FI_OPT_ENDPOINT,
+                            FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_getopt", res};
+        }
+        return maxConnectionDataSize;
     }
 };
