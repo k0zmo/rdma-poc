@@ -48,21 +48,17 @@ enum class WaitResult
 
 void handleConnection(RdmaEndpoint& in_endpoint)
 {
-    static uint64_t key = 1;
     int value = 0;
     constexpr auto bufSize = 5 * 1024 * 1024; // 1 MB
     std::unique_ptr<char[]> buf = std::make_unique<char[]>(bufSize);
     std::memset(buf.get(), value++, bufSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_SEND, 0, key++, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_SEND, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
         throw rdma_error{"fi_mr_reg", res};
     }
-
-    // Normally, fi_accept calls fi_enable but we want to post receive before doing so.
-    fi_enable(in_endpoint._endpoint.get());
 
     in_endpoint.receiveEmptyMessage();
 
@@ -80,7 +76,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     std::cout << "Waiting on connected event";
 
     uint32_t event;
-    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize();
+    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
     std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
     fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
 
@@ -249,7 +245,7 @@ void run(const AppOptions& in_cfg)
     RdmaAdapter adapter{std::move(fabricInfo)};
     RdmaListeningEndpoint listeningEndpoint{adapter};
 
-    const auto entryMaxSize = listeningEndpoint.getMaxConnectionDataSize();
+    const auto entryMaxSize = listeningEndpoint.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
     std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(entryMaxSize);
     fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
     uint32_t event = 0;

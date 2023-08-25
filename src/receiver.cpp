@@ -39,11 +39,10 @@ enum class WaitResult
 
 void handleConnected(RdmaEndpoint& in_endpoint)
 {
-    constexpr auto bufSize = 5 * 1024 * 1024; // 1 MB
-    static uint64_t key = 1;
+    constexpr auto bufSize = 5 * 1024 * 1024; // 5 MB
     std::unique_ptr<char[]> buf = std::make_unique<char[]>(bufSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_RECV, 0, key++, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_RECV, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -53,7 +52,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
     int numMessagesReceived = 0;
 
     uint32_t event = 0;
-    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize();
+    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
     std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
     fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
 
@@ -88,11 +87,11 @@ void handleConnected(RdmaEndpoint& in_endpoint)
                 }
             }
             else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
-        {
+            {
                 std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
                 waitResult = WaitResult::ERROR;
-            break;
-        }
+                break;
+            }
 
             ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
             if (ret != -FI_EAGAIN)
@@ -134,7 +133,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
         std::cout << "  Got " << numMessagesReceived << " message from the sender: " << entry.len << std::endl;
 
-        if (++numMessagesReceived > 10)
+        if (++numMessagesReceived > 100)
         {
             fi_shutdown(in_endpoint._endpoint.get(), 0);
             quit = true;
@@ -180,7 +179,7 @@ void run(const AppOptions& in_cfg)
         throw rdma_error{"fi_connect", res};
     }
 
-    const auto maxEntrySize = ep.getMaxConnectionDataSize();
+    const auto maxEntrySize = ep.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
     std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(maxEntrySize);
     fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
     uint32_t event = 0;

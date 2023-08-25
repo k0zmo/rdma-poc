@@ -191,6 +191,11 @@ inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName
         throw rdma_error{"fi_getinfo", res};
     }
 
+    if (!strcmp(fabricInfo->fabric_attr->prov_name, "tcp"))
+    {
+        fabricInfo->domain_attr->mr_mode |= FI_MR_PROV_KEY;
+    }
+
     return fabricInfo;
 }
 
@@ -270,6 +275,12 @@ struct RdmaEndpoint
         if (res != 0)
         {
             throw rdma_error{"fi_ep_bind to CQ", res};
+        }
+        // We want to post receive before accepting a connection.
+        res = fi_enable(_endpoint.get());
+        if (res != 0)
+        {
+            throw rdma_error{"fi_enable", res};
         }
     }
 
