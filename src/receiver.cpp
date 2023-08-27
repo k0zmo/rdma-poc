@@ -7,18 +7,22 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_eq.h>
+#include <rdma/fi_errno.h>
 
 #ifdef _WIN32
 #  include <winerror.h>
+#else
+#  include <sys/types.h>
 #endif
 
 #include <chrono>
 #include <cstring>
 #include <cstdint>
-#include <string>
+#include <exception>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
+#include <string>
+#include <utility>
 
 struct AppOptions
 {
@@ -32,7 +36,7 @@ bool quit = false;
 enum class WaitResult
 {
     GOT_MESSAGE,
-    ERROR,
+    GOT_ERROR,
     SHUTDOWN,
     TIMEOUT
 };
@@ -89,7 +93,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
             else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
             {
                 std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
-                waitResult = WaitResult::ERROR;
+                waitResult = WaitResult::GOT_ERROR;
                 break;
             }
 
@@ -116,7 +120,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
                 {
                     std::cout << "Error on CQ ?!" << std::endl;
                 }
-                waitResult = WaitResult::ERROR;
+                waitResult = WaitResult::GOT_ERROR;
                 break;
             }
         }

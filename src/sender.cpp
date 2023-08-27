@@ -11,17 +11,21 @@
 
 #ifndef _WIN32
 #  include <netinet/ip.h>
+#  include <sys/types.h>
 #endif
 
-#include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
-#include <vector>
+#include <utility>
+
 
 // For TCP proviver:
 //  - trzeba zawolac fi_eq_sread z krotkim timeoutem na samym poczatku (najlepiej bez zadnych zrodel)
@@ -41,7 +45,7 @@ struct AppOptions
 enum class WaitResult
 {
     GOT_MESSAGE,
-    ERROR,
+    GOT_ERROR,
     SHUTDOWN,
     TIMEOUT
 };
@@ -114,8 +118,8 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             }
             else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
             {
-                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
-                waitResult = WaitResult::ERROR;
+                std::cout << "Error on EQ: " << fi_strerror(static_cast<int>(ret)) << "\n";
+                waitResult = WaitResult::GOT_ERROR;
                 break;
             }
 
@@ -141,7 +145,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
                 {
                     std::cout << "Error on CQ ?!" << std::endl;
                 }
-                waitResult = WaitResult::ERROR;
+                waitResult = WaitResult::GOT_ERROR;
                 break;
             }
         }
@@ -182,8 +186,8 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             }
             else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
             {
-                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
-                waitResult = WaitResult::ERROR;
+                std::cout << "Error on EQ: " << fi_strerror(static_cast<int>(ret)) << "\n";
+                waitResult = WaitResult::GOT_ERROR;
                 break;
             }
 
@@ -201,19 +205,19 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             {
                 fi_cq_err_entry err{};
                 fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
-                    if (err.err_data_size > 0)
-                    {
-                        std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                        std::cout << "Error on CQ: " << errorMessage << std::endl;
-                    }
-                    else
-                    {
-                        std::cout << "Error on CQ ?!" << std::endl;
-                    }
-                waitResult = WaitResult::ERROR;
-                    break;
+                if (err.err_data_size > 0)
+                {
+                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
+                    std::cout << "Error on CQ: " << errorMessage << std::endl;
                 }
+                else
+                {
+                    std::cout << "Error on CQ ?!" << std::endl;
+                }
+                waitResult = WaitResult::GOT_ERROR;
+                break;
             }
+        }
 
         if (waitResult != WaitResult::GOT_MESSAGE)
         {
@@ -429,7 +433,7 @@ int main(int argc, char* argv[])
         }
         for (auto fi = fabricInfo.get(); fi; fi = fi->next)
         {
-            if (!std::string_view{fi->fabric_attr->prov_name}.rfind("ofi_hook_", -1))
+            if (!std::string_view{fi->fabric_attr->prov_name}.rfind("ofi_hook_", std::string::npos))
                 continue;
             if (ss.tellp() > 0)
                 ss << " ";

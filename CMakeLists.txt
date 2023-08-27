@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(FrameCache CXX)
+project(rdma-poc CXX)
 
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
 

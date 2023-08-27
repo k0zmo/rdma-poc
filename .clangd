@@ -1,0 +1,12 @@
+Diagnostics:
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+Index:
+  StandardLibrary: Yes
+Hover:
+  ShowAKA: Yes
+InlayHints:
+  Designators: Yes
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes

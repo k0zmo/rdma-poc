@@ -5,11 +5,20 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_eq.h>
+#include <rdma/fi_errno.h>
+
+#ifndef _WIN32
+#  include <sys/types.h>
+#endif
 
 #include <cassert>
+#include <cstring>
 #include <memory>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
 
 // Deleter that works for any type from libfabric but fi_info
 template <typename T>
