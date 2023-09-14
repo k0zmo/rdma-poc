@@ -62,8 +62,6 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
     while (true)
     {
-        //std::cin.get();
-
         std::cout << "Signaling to sender we're ready to receive new message\n";
         ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
@@ -75,6 +73,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
         const auto waitingStart = std::chrono::steady_clock::now();
         WaitResult waitResult = WaitResult::TIMEOUT;
+        unsigned numCompletion = 0;
         
         fi_cq_msg_entry entry;
         while(std::chrono::steady_clock::now() - waitingStart < std::chrono::seconds{5})
@@ -100,8 +99,16 @@ void handleConnected(RdmaEndpoint& in_endpoint)
             ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
             if (ret != -FI_EAGAIN)
             {
-                //std::cout << "CQ: got " << entry.flags << std::endl;
-                if ((entry.flags & (FI_RECV | FI_MSG)) == (FI_RECV | FI_MSG))
+                static constexpr std::uint64_t EXPECTED_COMPLETION[] = {FI_SEND | FI_MSG, FI_RECV | FI_MSG };
+                if ((entry.flags & EXPECTED_COMPLETION[numCompletion]) != EXPECTED_COMPLETION[numCompletion])
+                {
+                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
+                    waitResult = WaitResult::GOT_ERROR;
+                    break;
+                }
+
+                numCompletion += 1;
+                if (numCompletion > 1)
                 {
                     waitResult = WaitResult::GOT_MESSAGE;
                     break;
@@ -145,8 +152,7 @@ void handleConnected(RdmaEndpoint& in_endpoint)
         }
     }
 
-    //crashes on vrb_ep_close?!
-    //fi_shutdown(in_endpoint._endpoint.get(), 0);
+    fi_shutdown(in_endpoint._endpoint.get(), 0);
 }
 
 void run(const AppOptions& in_cfg)

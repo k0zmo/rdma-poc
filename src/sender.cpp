@@ -10,7 +10,10 @@
 #include <rdma/fi_errno.h>
 
 #ifndef _WIN32
+#  include <arpa/inet.h>
+#  include <netdb.h>
 #  include <netinet/ip.h>
+#  include <sys/socket.h>
 #  include <sys/types.h>
 #endif
 
@@ -25,15 +28,6 @@
 #include <string_view>
 #include <thread>
 #include <utility>
-
-
-// For TCP proviver:
-//  - trzeba zawolac fi_eq_sread z krotkim timeoutem na samym poczatku (najlepiej bez zadnych zrodel)
-//    tak zeby dostac nfds=3 a nie nfds=1 na ktorym poll() nie bedzie dzialac
-//  - przy poll'u trzeba zrobic +1, pomijajac pierwszy fd (ktory jest signalled dopoki nie zawolasz fi_eq_sread)
-//  - poll() potrafi zwrocic, po czym fi_eq_read zwraca EAGAIN i nastepny poll() jest juz OK
-// For verbs/ndirect
-//  - Przez to ze epoll'a nie ma na windowsie nie mozemy w ogole dostac FI_GETOBJ
 
 struct AppOptions
 {
@@ -126,9 +120,16 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
             if (ret != -FI_EAGAIN)
             {
-                if ((entry.flags & (FI_RECV | FI_MSG)) == (FI_RECV | FI_MSG))
+                constexpr auto EXPECTED_COMPLETION = FI_RECV | FI_MSG;
+                if ((entry.flags & EXPECTED_COMPLETION) == EXPECTED_COMPLETION)
                 {
                     waitResult = WaitResult::GOT_MESSAGE;
+                    break;
+                }
+                else
+                {
+                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
+                    waitResult = WaitResult::GOT_ERROR;
                     break;
                 }
             }
@@ -194,10 +195,16 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
             if (ret != -FI_EAGAIN)
             {
-                //std::cout << "CQ2: got " << entry.flags << std::endl;
-                if ((entry.flags & (FI_SEND | FI_MSG)) == (FI_SEND | FI_MSG))
+                constexpr auto EXPECTED_COMPLETION = FI_SEND | FI_MSG;
+                if ((entry.flags & EXPECTED_COMPLETION) == EXPECTED_COMPLETION)
                 {
                     waitResult = WaitResult::GOT_MESSAGE;
+                    break;
+                }
+                else
+                {
+                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
+                    waitResult = WaitResult::GOT_ERROR;
                     break;
                 }
             }
@@ -239,8 +246,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         }
     }
 
-    //crashes on vrb_ep_close?! seems like it can only be called on still valid QP
-    //fi_shutdown(in_endpoint._endpoint.get(), 0U);
+    fi_shutdown(in_endpoint._endpoint.get(), 0U);
 }
 
 void run(const AppOptions& in_cfg)
