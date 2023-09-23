@@ -38,7 +38,7 @@ struct AppOptions
 
 enum class WaitResult
 {
-    GOT_MESSAGE,
+    SENT_MESSAGE,
     GOT_ERROR,
     SHUTDOWN,
     TIMEOUT
@@ -46,12 +46,17 @@ enum class WaitResult
 
 void handleConnection(RdmaEndpoint& in_endpoint)
 {
-    int value = 0;
-    constexpr auto bufSize = 5 * 1024 * 1024; // 1 MB
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(bufSize);
-    std::memset(buf.get(), value++, bufSize);
+    static constexpr size_t BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
+    static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
+    static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
+    static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
+    static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
+    static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
+
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(BUFFER_SIZE);
+    std::memset(buf.get(), 0, BUFFER_SIZE);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_SEND, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), BUFFER_SIZE, FI_SEND, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -78,7 +83,8 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
     fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
 
-    ssize_t ret = fi_eq_sread(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 2000, 0U);
+    ssize_t ret = fi_eq_sread(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize,
+                              static_cast<int>(ACCEPT_TIMEOUT.count()), 0U);
     if (ret <= 0 || event != FI_CONNECTED)
     {
         std::cout << " - Failed to connect!\n";
@@ -86,95 +92,40 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     }
     std::cout << " - CONNECTED\n";
 
+    // Wait for first signal-ready message
+    fi_cq_msg_entry entry;
+    ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, 
+                      nullptr, static_cast<int>(INITIAL_RECV_TIMEOUT.count()));
+    if (ret <= 0 || (entry.flags & RECV_COMPLETION_FLAGS) != RECV_COMPLETION_FLAGS)
+    {
+        std::cout << "Didn't receive first signal-ready message\n";
+        return;
+    }
+
+    int numMessageSent = 0;
+    uintptr_t clientId = reinterpret_cast<uintptr_t>(&in_endpoint);
+
     while (true)
     {
         // Simulate some working being done
-        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
 
-        // wait until client is ready to receive data (by sending us an empty message)
-        std::cout << "Waiting on client send-sync.\n";
-
-        const auto waitingStart = std::chrono::steady_clock::now();
-        WaitResult waitResult = WaitResult::TIMEOUT;
-        fi_cq_msg_entry entry;
-        while(std::chrono::steady_clock::now() - waitingStart < std::chrono::seconds{5})
-        {
-            // Or after fi_cq_read?
-            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
-            if (ret > 0)
-            {
-                if (event == FI_SHUTDOWN)
-                {
-                    std::cout << "Received SHUTDOWN from the peer\n";
-                    waitResult = WaitResult::SHUTDOWN;
-                    break;
-                }
-            }
-            else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
-            {
-                std::cout << "Error on EQ: " << fi_strerror(static_cast<int>(ret)) << "\n";
-                waitResult = WaitResult::GOT_ERROR;
-                break;
-            }
-
-            ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
-            if (ret != -FI_EAGAIN)
-            {
-                constexpr auto EXPECTED_COMPLETION = FI_RECV | FI_MSG;
-                if ((entry.flags & EXPECTED_COMPLETION) == EXPECTED_COMPLETION)
-                {
-                    waitResult = WaitResult::GOT_MESSAGE;
-                    break;
-                }
-                else
-                {
-                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
-                    waitResult = WaitResult::GOT_ERROR;
-                    break;
-                }
-            }
-            else if (ret == -FI_EAVAIL)
-            {
-                fi_cq_err_entry err{};
-                fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
-                if (err.err_data_size > 0)
-                {
-                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                    std::cout << "Error on CQ: " << errorMessage << std::endl;
-                }
-                else
-                {
-                    std::cout << "Error on CQ ?!" << std::endl;
-                }
-                waitResult = WaitResult::GOT_ERROR;
-                break;
-            }
-        }
-
-        if (waitResult != WaitResult::GOT_MESSAGE)
-        {
-            if (waitResult == WaitResult::TIMEOUT)
-            {
-                std::cout << "Timeout receiving a sync-message\n";
-            }
-            break;
-        }
-
-        std::cout << "Got send-sync from client, sending a message.\n";
         in_endpoint.receiveEmptyMessage();
 
-        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()),
+        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), BUFFER_SIZE, fi_mr_desc(memoryRegion.get()),
                       FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
             throw rdma_error{"fi_recv", static_cast<int>(ret)};
         }
 
-        const auto sendingStart = std::chrono::steady_clock::now();
-        waitResult = WaitResult::TIMEOUT;
-        while(std::chrono::steady_clock::now() - sendingStart < std::chrono::seconds{5})
+        WaitResult waitResult = WaitResult::TIMEOUT;
+        bool nextRecvCompleted = false, sendCompleted = false;
+        std::chrono::milliseconds sendTimeout = SEND_TIMEOUT;
+        
+        while (sendTimeout.count() > 0)
         {
-            // Or after fi_cq_read?
+            // Check event queue first to check if the peer didn't disconnected on us
             ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
             if (ret > 0)
             {
@@ -187,28 +138,55 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             }
             else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
             {
-                std::cout << "Error on EQ: " << fi_strerror(static_cast<int>(ret)) << "\n";
+                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
                 waitResult = WaitResult::GOT_ERROR;
                 break;
             }
 
-            ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
-            if (ret != -FI_EAGAIN)
+            const auto waitingStart = std::chrono::steady_clock::now();
+            fi_cq_msg_entry entry;
+            ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(sendTimeout.count()));
+            if (ret == 1)
             {
-                constexpr auto EXPECTED_COMPLETION = FI_SEND | FI_MSG;
-                if ((entry.flags & EXPECTED_COMPLETION) == EXPECTED_COMPLETION)
+                if ((entry.flags & SEND_COMPLETION_FLAGS) == SEND_COMPLETION_FLAGS)
                 {
-                    waitResult = WaitResult::GOT_MESSAGE;
+                    sendCompleted = true;
+                }
+                else if ((entry.flags & RECV_COMPLETION_FLAGS) == RECV_COMPLETION_FLAGS)
+                {
+                    nextRecvCompleted = true;
+                }
+
+                // Both send and receive were completed, we send the message and the client is ready for the next message
+                if (sendCompleted && nextRecvCompleted)
+                {
+                    waitResult = WaitResult::SENT_MESSAGE;
                     break;
                 }
                 else
                 {
-                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
-                    waitResult = WaitResult::GOT_ERROR;
-                    break;
+                    // We receive first completion notification, adjust completion timeout for 2nd message
+                    sendTimeout -= std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitingStart);
                 }
             }
-            else if (ret == -FI_EAVAIL)
+            else if (ret == -FI_EAGAIN)
+            {
+            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
+                if (ret > 0 && event == FI_SHUTDOWN)
+                {
+                    std::cout << "Received SHUTDOWN from the peer\n";
+                    waitResult = WaitResult::SHUTDOWN;
+                }
+                else
+                {
+                    waitResult = WaitResult::TIMEOUT;
+                }
+                break;
+            }
+            else
+            {
+                if (ret == -FI_EAVAIL)
             {
                 fi_cq_err_entry err{};
                 fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
@@ -221,29 +199,28 @@ void handleConnection(RdmaEndpoint& in_endpoint)
                 {
                     std::cout << "Error on CQ ?!" << std::endl;
                 }
+                }
+                else
+                {
+                    std::cout << "Error on CQ: " << fi_strerror(static_cast<int>(ret)) <<  " (" << ret << ')' << std::endl;
+                }
                 waitResult = WaitResult::GOT_ERROR;
                 break;
             }
         }
 
-        if (waitResult != WaitResult::GOT_MESSAGE)
+        if (waitResult != WaitResult::SENT_MESSAGE)
         {
             if (waitResult == WaitResult::TIMEOUT)
             {
-                std::cout << "Timeout sending a payload message\n";
+                std::cout << clientId << ": Timeout sending a payload message\n";
             }
             break;
         }
 
-        std::cout << "Message (" << bufSize << " bytes) sent to client.\n";
-        std::memset(buf.get(), value, bufSize);
-        value = (value + 1) % 256;
-
-        if (value == 5)
-        {
-            //fi_shutdown(in_endpoint._endpoint.get(), 0U);
-            //break;
-        }
+        numMessageSent += 1;
+        std::cout << clientId << ": Message (" << numMessageSent << ", " << BUFFER_SIZE << " bytes) sent to client.\n";
+        std::memset(buf.get(), numMessageSent % 256, BUFFER_SIZE);
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0U);
