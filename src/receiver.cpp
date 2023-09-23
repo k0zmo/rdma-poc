@@ -43,10 +43,14 @@ enum class WaitResult
 
 void handleConnected(RdmaEndpoint& in_endpoint)
 {
-    constexpr auto bufSize = 5 * 1024 * 1024; // 5 MB
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(bufSize);
+    static constexpr size_t BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
+    static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::seconds{2};
+    static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
+    static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
+
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(BUFFER_SIZE);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), bufSize, FI_RECV, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), BUFFER_SIZE, FI_RECV, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -63,7 +67,8 @@ void handleConnected(RdmaEndpoint& in_endpoint)
     while (true)
     {
         std::cout << "Signaling to sender we're ready to receive new message\n";
-        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), bufSize, fi_mr_desc(memoryRegion.get()),
+
+        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), BUFFER_SIZE, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
@@ -71,14 +76,14 @@ void handleConnected(RdmaEndpoint& in_endpoint)
         }
         in_endpoint.sendEmptyMessage();
 
-        const auto waitingStart = std::chrono::steady_clock::now();
         WaitResult waitResult = WaitResult::TIMEOUT;
-        unsigned numCompletion = 0;
+        bool recvCompleted = false, sendCompleted = false;
+        std::chrono::milliseconds receiveTimeout = RECEIVE_TIMEOUT;
+        std::size_t bytesTransferred = 0;
         
-        fi_cq_msg_entry entry;
-        while(std::chrono::steady_clock::now() - waitingStart < std::chrono::seconds{5})
+        while (receiveTimeout.count() > 0)
         {
-            // Or after fi_cq_read?
+            // Check event queue first to check if the peer didn't disconnected on us
             ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
             if (ret > 0)
             {
@@ -96,25 +101,43 @@ void handleConnected(RdmaEndpoint& in_endpoint)
                 break;
             }
 
-            ret = fi_cq_read(in_endpoint._completionQueue.get(), &entry, 1);
-            if (ret != -FI_EAGAIN)
+            // Wait for both completions (send+recv) but no more than 2 seconds in total
+            const auto waitingStart = std::chrono::steady_clock::now();
+            fi_cq_msg_entry entry;
+            ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(receiveTimeout.count()));
+            if (ret == 1)
             {
-                static constexpr std::uint64_t EXPECTED_COMPLETION[] = {FI_SEND | FI_MSG, FI_RECV | FI_MSG };
-                if ((entry.flags & EXPECTED_COMPLETION[numCompletion]) != EXPECTED_COMPLETION[numCompletion])
+                if ((entry.flags & SEND_COMPLETION_FLAGS) == SEND_COMPLETION_FLAGS)
                 {
-                    std::cout << "Unexpected completion: " << entry.flags << " but expected: " << EXPECTED_COMPLETION;
-                    waitResult = WaitResult::GOT_ERROR;
-                    break;
+                    sendCompleted = true;
+                }
+                else if ((entry.flags & RECV_COMPLETION_FLAGS) == RECV_COMPLETION_FLAGS)
+                {
+                    recvCompleted = true;
+                    bytesTransferred = entry.len;
                 }
 
-                numCompletion += 1;
-                if (numCompletion > 1)
+                // Both send and receive were completed, we got the message
+                if (sendCompleted && recvCompleted)
                 {
                     waitResult = WaitResult::GOT_MESSAGE;
                     break;
                 }
+                else 
+                {
+                    // We receive first completion notification, adjust completion timeout for 2nd message
+                    receiveTimeout -= std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitingStart);
+                }
             }
-            else if (ret == -FI_EAVAIL)
+            else if (ret == -FI_EAGAIN)
+            {
+                waitResult = WaitResult::TIMEOUT;
+                break;
+            }
+            else
+            {
+                if (ret == -FI_EAVAIL)
             {
                 fi_cq_err_entry err{};
                 fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
@@ -126,6 +149,11 @@ void handleConnected(RdmaEndpoint& in_endpoint)
                 else
                 {
                     std::cout << "Error on CQ ?!" << std::endl;
+                }
+                }
+                else
+                {
+                    std::cout << "Error on CQ: " << fi_strerror(static_cast<int>(ret)) <<  " (" << ret << ')' << std::endl;
                 }
                 waitResult = WaitResult::GOT_ERROR;
                 break;
@@ -142,9 +170,10 @@ void handleConnected(RdmaEndpoint& in_endpoint)
             break;
         }
 
-        std::cout << "  Got " << numMessagesReceived << " message from the sender: " << entry.len << std::endl;
+        numMessagesReceived += 1;
+        std::cout << "  Got " << numMessagesReceived << " message from the sender: " << bytesTransferred << std::endl;
 
-        if (++numMessagesReceived > 100)
+        if (numMessagesReceived > 100)
         {
             fi_shutdown(in_endpoint._endpoint.get(), 0);
             quit = true;
