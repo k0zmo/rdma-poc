@@ -22,13 +22,14 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 
 struct AppOptions
 {
-    std::string address{"192.168.110.8"};
-    std::string port{"8001"};
-    std::string providerName{"verbs"};
+    std::string _address{"172.19.41.49"};
+    std::string _port{"8001"};
+    std::string _providerName{"verbs"};
 };
 
 bool quit = false;
@@ -66,8 +67,6 @@ void handleConnected(RdmaEndpoint& in_endpoint)
 
     while (true)
     {
-        std::cout << "Signaling to sender we're ready to receive new message\n";
-
         ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), BUFFER_SIZE, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
@@ -83,24 +82,6 @@ void handleConnected(RdmaEndpoint& in_endpoint)
         
         while (receiveTimeout.count() > 0)
         {
-            // Check event queue first to check if the peer didn't disconnected on us
-            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
-            if (ret > 0)
-            {
-                if (event == FI_SHUTDOWN)
-                {
-                    std::cout << "Received SHUTDOWN from the peer\n";
-                    waitResult = WaitResult::SHUTDOWN;
-                    break;
-                }
-            }
-            else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
-            {
-                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
-                waitResult = WaitResult::GOT_ERROR;
-                break;
-            }
-
             // Wait for both completions (send+recv) but no more than 2 seconds in total
             const auto waitingStart = std::chrono::steady_clock::now();
             fi_cq_msg_entry entry;
@@ -132,29 +113,39 @@ void handleConnected(RdmaEndpoint& in_endpoint)
             }
             else if (ret == -FI_EAGAIN)
             {
-                waitResult = WaitResult::TIMEOUT;
+                ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 10U);
+                if (ret > 0 && event == FI_SHUTDOWN)
+                {
+                    std::cout << "Received SHUTDOWN from the peer\n";
+                    waitResult = WaitResult::SHUTDOWN;
+                }
+                else
+                {
+                    waitResult = WaitResult::TIMEOUT;
+                }
                 break;
             }
             else
             {
+                std::string errorMessage;
+                int errorCode = (int)ret;
                 if (ret == -FI_EAVAIL)
-            {
-                fi_cq_err_entry err{};
-                fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
-                if (err.err_data_size > 0)
                 {
-                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                    std::cout << "Error on CQ: " << errorMessage << std::endl;
+                    fi_cq_err_entry err{};
+                    fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
+                    errorCode = err.err;
+                    if (err.err_data_size > 0)
+                    {
+                        errorMessage.assign((const char*)err.err_data, err.err_data_size);
+                    }
                 }
-                else
+                std::cout << "Error on CQ: " << fi_strerror(errorCode) <<  " (code: " << errorCode << ')';
+                if (!errorMessage.empty())
                 {
-                    std::cout << "Error on CQ ?!" << std::endl;
+                    std::cout << ". Message: " << errorMessage;
                 }
-                }
-                else
-                {
-                    std::cout << "Error on CQ: " << fi_strerror(static_cast<int>(ret)) <<  " (" << ret << ')' << std::endl;
-                }
+                std::cout << std::endl;
+
                 waitResult = WaitResult::GOT_ERROR;
                 break;
             }
@@ -184,12 +175,25 @@ void handleConnected(RdmaEndpoint& in_endpoint)
     fi_shutdown(in_endpoint._endpoint.get(), 0);
 }
 
+static bool isConnectionRefused(int in_fiErrorCode)
+{
+    if (in_fiErrorCode == FI_ECONNREFUSED)
+    {
+        return true;
+    }
+#ifdef _WIN32
+    if (in_fiErrorCode == WSAECONNREFUSED)
+    {
+        return true;
+    }
+#endif 
+    return false;
+}
+
 void run(const AppOptions& in_cfg)
 {
-    auto fabricInfo = getFabricInfo(in_cfg.providerName, in_cfg.address, in_cfg.port, false);
+    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, false);
     RdmaAdapter adapter{std::move(fabricInfo)};
-
-    // Start of receiver specific
     RdmaEndpoint ep{adapter};
 
     ClientConnectionFlowV1B clientData;
@@ -211,7 +215,7 @@ void run(const AppOptions& in_cfg)
     clientData._flowIdentifier[12] = 0x2b;
     clientData._flowIdentifier[13] = 0x15;
     clientData._flowIdentifier[14] = 0x8b;
-    clientData._flowIdentifier[15] = 0xd4;
+    clientData._flowIdentifier[15] = 0xd5;
     int res = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
     if (res != 0)
     {
@@ -225,35 +229,34 @@ void run(const AppOptions& in_cfg)
 
     while (!quit)
     {
-        const ssize_t rd = fi_eq_sread(ep._eventQueue.get(), &event, entry, maxEntrySize, -1, 0);
-        if (rd < 0)
+        const ssize_t res = fi_eq_sread(ep._eventQueue.get(), &event, entry, maxEntrySize, -1, 0);
+        if (res < 0)
         {
-            if (rd == -FI_EAVAIL)
+            if (res == -FI_EAVAIL)
             {
                 fi_eq_err_entry err{};
                 fi_eq_readerr(ep._eventQueue.get(), &err, 0);
-                if (err.err == FI_ECONNREFUSED
-#ifdef _WIN32
-                 || err.err == WSAECONNREFUSED
-#endif
-                )
+                if (isConnectionRefused(err.err))
                 {
                     if (err.err_data_size > 0)
                     {
-                        std::string errorMessage{(const char*)err.err_data, err.err_data_size};
+                        std::string_view errorMessage{(const char*)err.err_data, err.err_data_size};
                         std::cout << "Connection refused, reason: " << errorMessage << std::endl;
                     }
                     else
                     {
-                        std::cout << "Connection refused, unknown reason." << std::endl;
+                        std::cout << "Connection refused, reason unknown." << std::endl;
                     }
                 }
                 else
                 {
-                    std::cout << "Error while trying to establish a connection: " << fi_strerror(err.err) << std::endl;
+                    std::cout << "Error while trying to establish a connection: " << fi_strerror(err.err) << " (code: " << err.err << ")" << std::endl;
                 }
             }
-            std::cout << "Error calling fi_eq_sread(): " << rd << std::endl;
+            else
+            {
+                std::cout << "Error calling fi_eq_sread(): " << fi_strerror(res) << " (code: " << res << ")" << std::endl;
+            }
             break;
         }
         if (event == FI_SHUTDOWN)
@@ -267,13 +270,13 @@ void run(const AppOptions& in_cfg)
             continue;
         }
         std::unique_ptr<fi_info> entryRaii{entry->info};
-        if (static_cast<size_t>(rd) < sizeof(*entry))
+        if (static_cast<size_t>(res) < sizeof(*entry))
         {
-            std::cout << "Unexpected size of connection data: " << rd << std::endl;
+            std::cout << "Unexpected size of connection data: " << res << std::endl;
             continue;
         }
 
-        const auto connectionDataSize = rd - sizeof(*entry);
+        const auto connectionDataSize = res - sizeof(*entry);
         std::cout << "Received extra bytes: " << connectionDataSize << std::endl;
 
         ServerConnectionFlowV1B serverData;
@@ -283,8 +286,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-
-            handleConnected(ep);
+        handleConnected(ep);
     }
 }
 
@@ -298,13 +300,13 @@ int main(int argc, char* argv[])
         switch (opt)
         {
         case 'a':
-            options.address = optarg;
+            options._address = optarg;
             break;
         case 'B':
-            options.port = optarg;
+            options._port = optarg;
             break;
         case 'p':
-            options.providerName = optarg;
+            options._providerName = optarg;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;

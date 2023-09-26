@@ -19,21 +19,21 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 
 struct AppOptions
 {
-    std::string address{"192.168.110.8"};
-    std::string port{"8001"};
-    std::string providerName{"verbs"};
+    std::string _address{"172.19.41.49"};
+    std::string _port{"8001"};
+    std::string _providerName{"verbs"};
 };
 
 enum class WaitResult
@@ -125,24 +125,6 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         
         while (sendTimeout.count() > 0)
         {
-            // Check event queue first to check if the peer didn't disconnected on us
-            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
-            if (ret > 0)
-            {
-                if (event == FI_SHUTDOWN)
-                {
-                    std::cout << "Received SHUTDOWN from the peer\n";
-                    waitResult = WaitResult::SHUTDOWN;
-                    break;
-                }
-            }
-            else if (ret != -FI_EAGAIN && ret != -FI_EINTR)
-            {
-                std::cout << "Error on EQ: " << fi_strerror(ret) << "\n";
-                waitResult = WaitResult::GOT_ERROR;
-                break;
-            }
-
             const auto waitingStart = std::chrono::steady_clock::now();
             fi_cq_msg_entry entry;
             ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(sendTimeout.count()));
@@ -172,7 +154,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             }
             else if (ret == -FI_EAGAIN)
             {
-            ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 0U);
+                ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 10U);
                 if (ret > 0 && event == FI_SHUTDOWN)
                 {
                     std::cout << "Received SHUTDOWN from the peer\n";
@@ -186,24 +168,25 @@ void handleConnection(RdmaEndpoint& in_endpoint)
             }
             else
             {
+                std::string errorMessage;
+                int errorCode = (int)ret;
                 if (ret == -FI_EAVAIL)
-            {
-                fi_cq_err_entry err{};
-                fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
-                if (err.err_data_size > 0)
                 {
-                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                    std::cout << "Error on CQ: " << errorMessage << std::endl;
+                    fi_cq_err_entry err{};
+                    fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
+                    errorCode = err.err;
+                    if (err.err_data_size > 0)
+                    {
+                        errorMessage.assign((const char*)err.err_data, err.err_data_size);
+                    }
                 }
-                else
+                std::cout << "Error on CQ: " << fi_strerror(errorCode) <<  " (code: " << errorCode << ')';
+                if (!errorMessage.empty())
                 {
-                    std::cout << "Error on CQ ?!" << std::endl;
+                    std::cout << ". Message: " << errorMessage;
                 }
-                }
-                else
-                {
-                    std::cout << "Error on CQ: " << fi_strerror(static_cast<int>(ret)) <<  " (" << ret << ')' << std::endl;
-                }
+                std::cout << std::endl;
+
                 waitResult = WaitResult::GOT_ERROR;
                 break;
             }
@@ -228,7 +211,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
 void run(const AppOptions& in_cfg)
 {
-    auto fabricInfo = getFabricInfo(in_cfg.providerName, in_cfg.address, in_cfg.port, true);
+    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, true);
     RdmaAdapter adapter{std::move(fabricInfo)};
     RdmaListeningEndpoint listeningEndpoint{adapter};
 
@@ -240,52 +223,50 @@ void run(const AppOptions& in_cfg)
     while (true)
     {
         const auto eq = listeningEndpoint._eventQueue.get();
-        std::cout << "  Calling fi_eq_sread()\n";
-        const ssize_t bytesRead = fi_eq_sread(eq, &event, entry, entryMaxSize, -1, 0);
-        std::cout << "  fi_eq_sread: " << bytesRead << ", event: " << event << std::endl;
-
-        if (bytesRead == -FI_EAGAIN || bytesRead == -FI_EINTR)
+        const ssize_t res = fi_eq_sread(eq, &event, entry, entryMaxSize, -1, 0);
+        if (res == -FI_EAGAIN || res == -FI_EINTR)
         {
             continue;
         }
     
-        if (bytesRead < 0)
+        if (res < 0)
         {
-            if (bytesRead == -FI_EAVAIL)
+            std::string errorMessage;
+            int errorCode = (int)res;
+            if (res == -FI_EAVAIL)
             {
                 fi_eq_err_entry err{};
                 fi_eq_readerr(eq, &err, 0);
+                errorCode = err.err;
                 if (err.err_data_size > 0)
                 {
-                    std::string errorMessage{(const char*)err.err_data, err.err_data_size};
-                    std::cout << "Error calling fi_eq_sread(): " << errorMessage << std::endl;
-                }
-                else
-                {
-                    std::cout << "Error calling fi_eq_sread(), unknown reason" << bytesRead << std::endl;
+                    errorMessage.assign((const char*)err.err_data, err.err_data_size);
                 }
             }
-            else
+
+            std::cout << "Error calling fi_eq_sread(): " << fi_strerror(errorCode) << " (code: " << errorCode << ")";
+            if (!errorMessage.empty())
             {
-                std::cout << "Error calling fi_eq_sread(): " << bytesRead << std::endl;
+                std::cout << ". Message: " << errorMessage;
             }
+            std::cout << std::endl;
             continue;
         }
         if (event != FI_CONNREQ)
         {
-            std::cout << "EQ: Unexpected event - " << event << std::endl;
+            std::cout << "Unexpected event - " << event << std::endl;
             continue;
         }
 
         std::unique_ptr<fi_info> entryRaii{entry->info};
-        if (static_cast<size_t>(bytesRead) < sizeof(*entry))
+        if (static_cast<size_t>(res) < sizeof(*entry))
         {
-            std::cout << "EQ: Unexpected size of connection data: " << bytesRead << std::endl;
+            std::cout << "Unexpected size of connection data: " << res << std::endl;
             continue;
         }
 
-        const auto connectionDataSize = bytesRead - sizeof(*entry);
-        std::cout << "EQ: Received extra bytes: " << connectionDataSize << std::endl;
+        const auto connectionDataSize = res - sizeof(*entry);
+        std::cout << "Received extra bytes: " << connectionDataSize << std::endl;
 
         std::stringstream errorMessageStream;
 
@@ -314,36 +295,40 @@ void run(const AppOptions& in_cfg)
 #endif
                     }
 
-                    std::stringstream ss;
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[0];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[1];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[2];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[3];
-                    ss << '-';
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[4];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[5];
-                    ss << '-';
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[6];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[7];
-                    ss << '-';
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[8];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[9];
-                    ss << '-';
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[10];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[11];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[12];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[13];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[14];
-                    ss << std::hex << +clientConnectionV1._flowIdentifier[15];
+                    char flowId[32 + 4 + 1];
+                    std::sprintf(flowId, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                        clientConnectionV1._flowIdentifier[0],
+                        clientConnectionV1._flowIdentifier[1],
+                        clientConnectionV1._flowIdentifier[2],
+                        clientConnectionV1._flowIdentifier[3],
+                        clientConnectionV1._flowIdentifier[4],
+                        clientConnectionV1._flowIdentifier[5],
+                        clientConnectionV1._flowIdentifier[6],
+                        clientConnectionV1._flowIdentifier[7],
+                        clientConnectionV1._flowIdentifier[8],
+                        clientConnectionV1._flowIdentifier[9],
+                        clientConnectionV1._flowIdentifier[10],
+                        clientConnectionV1._flowIdentifier[11],
+                        clientConnectionV1._flowIdentifier[12],
+                        clientConnectionV1._flowIdentifier[13],
+                        clientConnectionV1._flowIdentifier[14],
+                        clientConnectionV1._flowIdentifier[15]);
 
                     std::cout << "Connection data:"
-                              << "\nFlow identifier: " << ss.str()
-                              << "\nWants metadata: " << std::boolalpha << clientConnectionV1._wantsFrameMetadata << std::endl;
+                              << "\n  Flow identifier: " << flowId
+                              << "\n  Wants metadata: " << std::boolalpha << clientConnectionV1._wantsFrameMetadata << std::endl;
 
-                    std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
-                        handleConnection(ep);
-                    }};
-                    th.detach();
+                    if (!std::strcmp(flowId, "e569f502-8891-4c9f-92d4-51702b158bd5"))
+                    {
+                        std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
+                            handleConnection(ep);
+                        }};
+                        th.detach();
+                    }
+                    else
+                    {
+                        errorMessageStream << "Flow does not exist";
+                    }
                 }
                 else
                 {
@@ -388,13 +373,13 @@ int main(int argc, char* argv[])
         switch (opt)
         {
         case 'a':
-            options.address = optarg;
+            options._address = optarg;
             break;
         case 'B':
-            options.port = optarg;
+            options._port = optarg;
             break;
         case 'p':
-            options.providerName = optarg;
+            options._providerName = optarg;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
@@ -405,25 +390,7 @@ int main(int argc, char* argv[])
     }
 
     try
-    {
-        std::stringstream ss;
-        std::unique_ptr<fi_info> fabricInfo;
-        int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), nullptr, nullptr, FI_PROV_ATTR_ONLY,
-                             nullptr, makeOutPointer(fabricInfo));
-        if (res != 0)
-        {
-            throw rdma_error{"fi_getinfo", res};
-        }
-        for (auto fi = fabricInfo.get(); fi; fi = fi->next)
-        {
-            if (!std::string_view{fi->fabric_attr->prov_name}.rfind("ofi_hook_", std::string::npos))
-                continue;
-            if (ss.tellp() > 0)
-                ss << " ";
-            ss << fi->fabric_attr->prov_name;
-        }
-        std::cout << "Compiled providers: " << ss.rdbuf() << std::endl;
-        
+    {       
         run(options);
     }
     catch (const std::exception& ex)
