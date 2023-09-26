@@ -126,7 +126,6 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         while (sendTimeout.count() > 0)
         {
             const auto waitingStart = std::chrono::steady_clock::now();
-            fi_cq_msg_entry entry;
             ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(sendTimeout.count()));
             if (ret == 1)
             {

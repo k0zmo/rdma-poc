@@ -216,10 +216,10 @@ void run(const AppOptions& in_cfg)
     clientData._flowIdentifier[13] = 0x15;
     clientData._flowIdentifier[14] = 0x8b;
     clientData._flowIdentifier[15] = 0xd5;
-    int res = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
-    if (res != 0)
+    int connectRes = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
+    if (connectRes != 0)
     {
-        throw rdma_error{"fi_connect", res};
+        throw rdma_error{"fi_connect", connectRes};
     }
 
     const auto maxEntrySize = ep.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
@@ -255,7 +255,7 @@ void run(const AppOptions& in_cfg)
             }
             else
             {
-                std::cout << "Error calling fi_eq_sread(): " << fi_strerror(res) << " (code: " << res << ")" << std::endl;
+                std::cout << "Error calling fi_eq_sread(): " << fi_strerror((int)res) << " (code: " << res << ")" << std::endl;
             }
             break;
         }
