@@ -320,10 +320,18 @@ void run(const AppOptions& in_cfg)
 
                     if (!std::strcmp(flowId, "e569f502-8891-4c9f-92d4-51702b158bd5"))
                     {
-                        std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
-                            handleConnection(ep);
-                        }};
-                        th.detach();
+                        try
+                        {
+                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
+                                handleConnection(ep);
+                            }};
+                            th.detach();
+                        }
+                        catch (const std::exception& ex)
+                        {
+                            std::cout << "EXCEPTION when creating RdmaEndpoint: " << ex.what() << std::endl;
+                            errorMessageStream << "EXCEPTION when creating RdmaEndpoint";
+                        }
                     }
                     else
                     {
@@ -395,6 +403,6 @@ int main(int argc, char* argv[])
     }
     catch (const std::exception& ex)
     {
-        std::cerr << "Unhandled exception: " << ex.what() << std::endl;
+        std::cerr << "EXCEPTION from main thread: " << ex.what() << std::endl;
     }
 }

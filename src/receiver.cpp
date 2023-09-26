@@ -322,6 +322,6 @@ int main(int argc, char* argv[])
     }
     catch (const std::exception& ex)
     {
-        std::cerr << "Unhandled exception: " << ex.what() << std::endl;
+        std::cerr << "EXCEPTION on main thread: " << ex.what() << std::endl;
     }
 }
