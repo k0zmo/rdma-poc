@@ -24,7 +24,9 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
+#include <vector>
 
 struct AppOptions
 {
@@ -192,11 +194,9 @@ static bool isConnectionRefused(int in_fiErrorCode)
     return false;
 }
 
-void run(const AppOptions& in_cfg)
+void run(RdmaAdapter& in_adapter, int in_numMessages)
 {
-    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, false);
-    RdmaAdapter adapter{std::move(fabricInfo)};
-    RdmaEndpoint ep{adapter};
+    RdmaEndpoint ep{in_adapter};
 
     ClientConnectionFlowV1B clientData;
     clientData._wantsFrameMetadata = false;
@@ -218,7 +218,7 @@ void run(const AppOptions& in_cfg)
     clientData._flowIdentifier[13] = 0x15;
     clientData._flowIdentifier[14] = 0x8b;
     clientData._flowIdentifier[15] = 0xd5;
-    int connectRes = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
+    int connectRes = fi_connect(ep._endpoint.get(), in_adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
     if (connectRes != 0)
     {
         throw rdma_error{"fi_connect", connectRes};
@@ -288,7 +288,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-        handleConnected(ep, in_cfg._numMessages);
+        handleConnected(ep, in_numMessages);
     }
 }
 
@@ -323,7 +323,24 @@ int main(int argc, char* argv[])
 
     try
     {
-        run(options);
+        auto fabricInfo = getFabricInfo(options._providerName, options._address, options._port, false);
+        RdmaAdapter adapter{std::move(fabricInfo)};
+
+        std::vector<std::thread> receivers;
+        for (int i = 0; i < 20; ++i)
+        {
+            receivers.emplace_back([&]() {
+                while (true)
+                {
+                    quit = false;
+                    run(adapter, options._numMessages);
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                }
+            });
+        }
+
+        for (auto& thread : receivers)
+            thread.join();
     }
     catch (const std::exception& ex)
     {

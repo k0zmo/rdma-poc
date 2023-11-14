@@ -21,6 +21,7 @@
 #  include <ws2tcpip.h>
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -46,6 +47,12 @@ enum class WaitResult
     GOT_ERROR,
     SHUTDOWN,
     TIMEOUT
+};
+
+struct SenderState
+{
+    static constexpr auto MAX_NUM_CONNECTIONS = 5U;
+    std::atomic<unsigned> _numConnections = 0;
 };
 
 void handleConnection(RdmaEndpoint& in_endpoint)
@@ -214,6 +221,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
 void run(const AppOptions& in_cfg)
 {
+    auto senderState = std::make_shared<SenderState>();
     auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, true);
     RdmaAdapter adapter{std::move(fabricInfo)};
     RdmaListeningEndpoint listeningEndpoint{adapter};
@@ -334,12 +342,15 @@ void run(const AppOptions& in_cfg)
                               << "\n  Flow identifier: " << flowId
                               << "\n  Wants metadata: " << std::boolalpha << clientConnectionV1._wantsFrameMetadata << std::endl;
 
-                    if (!std::strcmp(flowId, "e569f502-8891-4c9f-92d4-51702b158bd5"))
+                    if (!std::strcmp(flowId, "e569f502-8891-4c9f-92d4-51702b158bd5") &&
+                        senderState->_numConnections < SenderState::MAX_NUM_CONNECTIONS)
                     {
+                         ++senderState->_numConnections;
                         try
                         {
-                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
+                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, ss = senderState]() mutable -> void {
                                 handleConnection(ep);
+                                --ss->_numConnections;
                             }};
                             th.detach();
                         }
