@@ -98,7 +98,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
     // Wait for first signal-ready message
     fi_cq_msg_entry entry;
-    ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, 
+    ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1,
                       nullptr, static_cast<int>(INITIAL_RECV_TIMEOUT.count()));
     if (ret <= 0 || (entry.flags & RECV_COMPLETION_FLAGS) != RECV_COMPLETION_FLAGS)
     {
@@ -126,7 +126,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         WaitResult waitResult = WaitResult::TIMEOUT;
         bool nextRecvCompleted = false, sendCompleted = false;
         std::chrono::milliseconds sendTimeout = SEND_TIMEOUT;
-        
+
         while (sendTimeout.count() > 0)
         {
             const auto waitingStart = std::chrono::steady_clock::now();
@@ -142,7 +142,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
                     nextRecvCompleted = true;
                 }
 
-                // Both send and receive were completed, we send the message and the client is ready for the next message
+                // Both send and receive were completed, we sent the message and the client is ready for the next message
                 if (sendCompleted && nextRecvCompleted)
                 {
                     waitResult = WaitResult::SENT_MESSAGE;
@@ -231,7 +231,7 @@ void run(const AppOptions& in_cfg)
         {
             continue;
         }
-    
+
         if (res < 0)
         {
             std::string errorMessage;
@@ -375,7 +375,7 @@ void run(const AppOptions& in_cfg)
                     errorMessage.resize(entryMaxSize - 1);
                 }
                 fi_reject(listeningEndpoint._passiveEndpoint.get(), entry->info->handle,
-                            errorMessage.c_str(), errorMessage.size() + 1);               
+                          errorMessage.c_str(), errorMessage.size() + 1);
             }
         }
         else
@@ -414,7 +414,7 @@ int main(int argc, char* argv[])
     }
 
     try
-    {       
+    {
         run(options);
     }
     catch (const std::exception& ex)

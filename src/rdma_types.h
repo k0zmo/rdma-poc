@@ -31,7 +31,7 @@ struct FabricInterfaceDeleter
             int res = fi_close(&in_pointer->fid);
             assert(res == 0); (void) res;
         }
-    } 
+    }
 };
 
 template <>
@@ -274,7 +274,7 @@ struct RdmaEndpoint
         {
             throw rdma_error{"fi_cq_open", res};
         }
-    
+
         res = fi_ep_bind(_endpoint.get(), toFid(_eventQueue), 0);
         if (res != 0)
         {
