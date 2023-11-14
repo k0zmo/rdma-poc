@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -30,6 +31,7 @@ struct AppOptions
     std::string _address{"172.19.41.49"};
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
+    int _numMessages{100};
 };
 
 bool quit = false;
@@ -42,7 +44,7 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnected(RdmaEndpoint& in_endpoint)
+void handleConnected(RdmaEndpoint& in_endpoint, int maxMessages)
 {
     static constexpr size_t BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
     static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::seconds{2};
@@ -164,9 +166,9 @@ void handleConnected(RdmaEndpoint& in_endpoint)
         numMessagesReceived += 1;
         std::cout << "  Got " << numMessagesReceived << " message from the sender: " << bytesTransferred << std::endl;
 
-        if (numMessagesReceived > 100)
+        if (maxMessages > 0 && numMessagesReceived >= maxMessages)
         {
-            fi_shutdown(in_endpoint._endpoint.get(), 0);
+            std::cout << "Sent " << maxMessages << ". Quitting\n";
             quit = true;
             break;
         }
@@ -286,7 +288,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-        handleConnected(ep);
+        handleConnected(ep, in_cfg._numMessages);
     }
 }
 
@@ -295,7 +297,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:")) != -1)
     {
         switch (opt)
         {
@@ -307,6 +309,9 @@ int main(int argc, char* argv[])
             break;
         case 'p':
             options._providerName = optarg;
+            break;
+        case 'n':
+            options._numMessages = std::atoi(optarg);
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
