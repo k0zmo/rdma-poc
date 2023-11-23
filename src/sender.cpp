@@ -9,6 +9,10 @@
 #include <rdma/fi_eq.h>
 #include <rdma/fi_errno.h>
 
+#include <rdma/fi_ext.h>
+#include <rdma/providers/fi_log.h>
+#include <rdma/providers/fi_prov.h>
+
 #ifndef _WIN32
 #  include <arpa/inet.h>
 #  include <netdb.h>
@@ -387,6 +391,77 @@ void run(const AppOptions& in_cfg)
     }
 }
 
+static int logging_enabled(const fi_provider* prov, fi_log_level level, fi_log_subsys subsys, uint64_t flags)
+{
+    (void)prov;
+    (void)subsys;
+    (void)flags;
+    return level <= FI_LOG_DEBUG;
+}
+
+static int logging_ready(const fi_provider* prov, fi_log_level level, fi_log_subsys subsys, uint64_t flags,
+                         uint64_t* showtime)
+{
+    if (logging_enabled(prov, level, subsys, flags))
+    {
+        const auto cur = std::chrono::steady_clock::now();
+        const auto curMs = std::chrono::duration_cast<std::chrono::milliseconds>(cur.time_since_epoch()).count();
+        if ((uint64_t)curMs >= *showtime)
+        {
+            *showtime = curMs + (uint64_t) + 2000;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void logging_log(const fi_provider* prov, fi_log_level level, fi_log_subsys subsys,
+                        const char* func, int line, const char* msg)
+{
+    const char* subsys_str = [&] {
+        switch (subsys)
+        {
+        case FI_LOG_CORE:       return "core";
+        case FI_LOG_FABRIC:     return "fabric";
+        case FI_LOG_DOMAIN:     return "domain";
+        case FI_LOG_EP_CTRL:    return "ep_ctrl";
+        case FI_LOG_EP_DATA:    return "ep_data";
+        case FI_LOG_AV:         return "av";
+        case FI_LOG_CQ:         return "cq";
+        case FI_LOG_EQ:         return "eq";
+        case FI_LOG_MR:         return "mr";
+        case FI_LOG_CNTR:       return "cntr";
+        case FI_LOG_SUBSYS_MAX: break;
+        }
+        return "";
+    }();
+    const char* log_level_str = [&] {
+        switch (level)
+        {
+        case FI_LOG_WARN:  return "warn";
+        case FI_LOG_TRACE: return "trace";
+        case FI_LOG_INFO:  return "info";
+        case FI_LOG_DEBUG: return "debug";
+        case FI_LOG_MAX:   break;
+        }
+        return "";
+    }();
+
+    fprintf(stderr, "[%s:%s] %s <%s:%d> %s", prov->name, subsys_str, log_level_str, func, line, msg);
+}
+
+static fi_ops_log log_ops{
+    /*.size = */   sizeof(fi_ops_log),
+    /*.enabled = */&logging_enabled,
+    /*.ready = */  &logging_ready,
+    /*.log = */    &logging_log
+};
+
+static fid_logging logger{
+    /*.fid = */{},
+    /*.ops = */&log_ops
+};
+
 int main(int argc, char* argv[])
 {
     AppOptions options;
@@ -412,6 +487,8 @@ int main(int argc, char* argv[])
             return 1;
         }
     }
+
+    fi_import_log(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), 0, &logger);
 
     try
     {
