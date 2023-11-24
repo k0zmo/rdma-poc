@@ -274,16 +274,16 @@ void run(const AppOptions& in_cfg)
 
         const auto connectionDataSize = res - sizeof(*entry);
         std::string inboundAddr;
-        if (entry->info->src_addrlen == INET_ADDRSTRLEN)
+        if (entry->info->dest_addrlen == INET_ADDRSTRLEN)
         {
             inboundAddr.resize(INET_ADDRSTRLEN);
-            auto* sockAddr = reinterpret_cast<sockaddr_in*>(entry->info->src_addr);
+            auto* sockAddr = reinterpret_cast<sockaddr_in*>(entry->info->dest_addr);
             inet_ntop(AF_INET, &sockAddr->sin_addr, inboundAddr.data(), inboundAddr.size());
         }
-        else if (entry->info->src_addrlen == INET6_ADDRSTRLEN)
+        else if (entry->info->dest_addrlen == INET6_ADDRSTRLEN)
         {
             inboundAddr.resize(INET6_ADDRSTRLEN);
-            auto* sockAddr = reinterpret_cast<sockaddr_in6*>(entry->info->src_addr);
+            auto* sockAddr = reinterpret_cast<sockaddr_in6*>(entry->info->dest_addr);
             inet_ntop(AF_INET6, &sockAddr->sin6_addr, inboundAddr.data(), inboundAddr.size());
         }
         std::cout << "Connection inbound (" << inboundAddr << "). Received extra bytes: " << connectionDataSize << std::endl;
