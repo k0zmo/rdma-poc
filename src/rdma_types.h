@@ -9,9 +9,16 @@
 
 #ifndef _WIN32
 #  include <sys/types.h>
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#else
+#include <ws2tcpip.h>
 #endif
 
+#include <string.h>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -19,6 +26,8 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+
+inline const auto FABRIC_VERSION = FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION);
 
 // Deleter that works for any type from libfabric but fi_info
 template <typename T>
@@ -163,8 +172,8 @@ private:
                                           int in_errorCode)
     {
         std::stringstream ss;
-        ss << in_functionName << " returned " << fi_strerror(in_errorCode)
-           << " (" << in_errorCode << ")";
+        ss << in_functionName << " returned: '" << fi_strerror(in_errorCode)
+           << " (" << in_errorCode << ")'";
         return ss.str();
     }
 };
@@ -175,26 +184,76 @@ fid_t toFid(const T& in_fabricInterface)
     return &in_fabricInterface.get()->fid;
 }
 
-inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
-                                              const std::string& in_adapterAddress,
-                                              const std::string& in_service,
-                                              bool in_isListener)
+inline std::shared_ptr<fi_info> createFabricInfoHints(const std::string& in_providerName,
+                                                      const std::string& in_srcAddress)
 {
-    std::unique_ptr<fi_info> hints{fi_allocinfo()};
-    if (!hints)
+    fi_info* rawHints = fi_allocinfo();
+    if ( !rawHints )
     {
         throw rdma_error{"hints is null", -FI_ENOMEM};
     }
+    std::shared_ptr<fi_info> hints{rawHints, fi_freeinfo};
 
     hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
     hints->ep_attr->type = FI_EP_MSG;
     hints->caps = FI_MSG;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-    hints->addr_format = FI_SOCKADDR_IN;
+    hints->rx_attr->iov_limit = 4;
+    hints->tx_attr->iov_limit = 4;
 
+    if (!in_srcAddress.empty())
+    {
+        in_addr srcAddr{};
+        if (inet_pton(AF_INET, in_srcAddress.c_str(), &srcAddr) == 1)
+        {
+            sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(malloc(sizeof(sockaddr_in)));
+            memset(addr, 0, sizeof(sockaddr_in));
+            addr->sin_addr = srcAddr;
+            addr->sin_family = AF_INET;
+            hints->addr_format = FI_SOCKADDR_IN;
+            hints->src_addr = addr; // libfabric release it by calling free()
+            hints->src_addrlen = sizeof(sockaddr_in);
+        }
+        else
+        {
+            // TODO ipv6
+            throw rdma_error{"Invalid source address", -FI_ENODATA};
+        }
+    }
+
+    return hints;
+}
+
+inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
+                                              const std::string& in_destAddress,
+                                              const std::string& in_destPort,
+                                              const std::string& in_srcAddress)
+{
+    std::shared_ptr<fi_info> hints = createFabricInfoHints(in_providerName, in_srcAddress);
     std::shared_ptr<fi_info> fabricInfo;
-    int res = fi_getinfo(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), in_adapterAddress.c_str(), in_service.c_str(),
-                         in_isListener ? FI_SOURCE : 0U, hints.get(), makeOutPointer(fabricInfo));
+    int res = fi_getinfo(FABRIC_VERSION, in_destAddress.c_str(), in_destPort.c_str(),
+                         0U, hints.get(), makeOutPointer(fabricInfo));
+    if (res != 0)
+    {
+        throw rdma_error{"fi_getinfo", res};
+    }
+
+    if (!strcmp(fabricInfo->fabric_attr->prov_name, "tcp"))
+    {
+        fabricInfo->domain_attr->mr_mode |= FI_MR_PROV_KEY;
+    }
+
+    return fabricInfo;
+}
+
+inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
+                                              const std::string& in_srcAddress,
+                                              const std::string& in_srcPort)
+{
+    std::shared_ptr<fi_info> hints = createFabricInfoHints(in_providerName, "");
+    std::shared_ptr<fi_info> fabricInfo;
+    int res = fi_getinfo(FABRIC_VERSION, in_srcAddress.c_str(), in_srcPort.c_str(),
+                         FI_SOURCE, hints.get(), makeOutPointer(fabricInfo));
     if (res != 0)
     {
         throw rdma_error{"fi_getinfo", res};

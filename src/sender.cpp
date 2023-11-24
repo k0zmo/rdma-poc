@@ -218,7 +218,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
 void run(const AppOptions& in_cfg)
 {
-    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, true);
+    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port);
     RdmaAdapter adapter{std::move(fabricInfo)};
     RdmaListeningEndpoint listeningEndpoint{adapter};
 

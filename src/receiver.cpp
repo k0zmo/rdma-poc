@@ -31,6 +31,7 @@ struct AppOptions
     std::string _address{"172.19.41.49"};
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
+    std::string _localAddress{};
     int _numMessages{100};
 };
 
@@ -194,7 +195,7 @@ static bool isConnectionRefused(int in_fiErrorCode)
 
 void run(const AppOptions& in_cfg)
 {
-    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, false);
+    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port, in_cfg._localAddress);
     RdmaAdapter adapter{std::move(fabricInfo)};
     RdmaEndpoint ep{adapter};
 
@@ -297,7 +298,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:I:")) != -1)
     {
         switch (opt)
         {
@@ -312,6 +313,9 @@ int main(int argc, char* argv[])
             break;
         case 'n':
             options._numMessages = std::atoi(optarg);
+            break;
+        case 'I':
+            options._localAddress = optarg;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
