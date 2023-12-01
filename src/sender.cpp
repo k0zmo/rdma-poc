@@ -74,7 +74,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     in_endpoint.receiveEmptyMessage();
 
     ServerConnectionFlowV1B serverData{};
-    serverData._frameSize = 1024;
+    serverData._frameSize = BUFFER_SIZE;
     serverData._acceptConnectionTime = 1111111;
     serverData._hasActiveProducers = true;
     serverData._frameMetadataSize = 16;

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -32,6 +33,7 @@ struct AppOptions
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
     std::string _localAddress{};
+    std::string _flowId{};
     int _numMessages{100};
 };
 
@@ -45,16 +47,15 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnected(RdmaEndpoint& in_endpoint, int maxMessages)
+void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_maxMessages)
 {
-    static constexpr size_t BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
     static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(BUFFER_SIZE);
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(in_messageSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), BUFFER_SIZE, FI_RECV, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), in_messageSize, FI_RECV, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -70,7 +71,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, int maxMessages)
 
     while (true)
     {
-        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), BUFFER_SIZE, fi_mr_desc(memoryRegion.get()),
+        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), in_messageSize, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
@@ -167,9 +168,9 @@ void handleConnected(RdmaEndpoint& in_endpoint, int maxMessages)
         numMessagesReceived += 1;
         std::cout << "  Got " << numMessagesReceived << " message from the sender: " << bytesTransferred << std::endl;
 
-        if (maxMessages > 0 && numMessagesReceived >= maxMessages)
+        if (in_maxMessages > 0 && numMessagesReceived >= in_maxMessages)
         {
-            std::cout << "Sent " << maxMessages << ". Quitting\n";
+            std::cout << "Sent " << in_maxMessages << ". Quitting\n";
             quit = true;
             break;
         }
@@ -202,23 +203,33 @@ void run(const AppOptions& in_cfg)
     ClientConnectionFlowV1B clientData;
     clientData._wantsFrameMetadata = false;
     clientData._identifier = PROTOCOL_IDENTIFIER;
-    // "e569f502-8891-4c9f-92d4-51702b158bd5";
-    clientData._flowIdentifier[0] = 0xe5;
-    clientData._flowIdentifier[1] = 0x69;
-    clientData._flowIdentifier[2] = 0xf5;
-    clientData._flowIdentifier[3] = 0x02;
-    clientData._flowIdentifier[4] = 0x88;
-    clientData._flowIdentifier[5] = 0x91;
-    clientData._flowIdentifier[6] = 0x4c;
-    clientData._flowIdentifier[7] = 0x9f;
-    clientData._flowIdentifier[8] = 0x92;
-    clientData._flowIdentifier[9] = 0xd4;
-    clientData._flowIdentifier[10] = 0x51;
-    clientData._flowIdentifier[11] = 0x70;
-    clientData._flowIdentifier[12] = 0x2b;
-    clientData._flowIdentifier[13] = 0x15;
-    clientData._flowIdentifier[14] = 0x8b;
-    clientData._flowIdentifier[15] = 0xd5;
+
+    if (!in_cfg._flowId.empty())
+    {
+        auto& fi = clientData._flowIdentifier;
+        std::memset(&clientData._flowIdentifier, 0, sizeof(clientData._flowIdentifier));
+        (void)std::sscanf( // Dont bother validating it
+            in_cfg._flowId.c_str(),
+            "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
+            &fi[0], &fi[1], &fi[2], &fi[3],
+            &fi[4], &fi[5],
+            &fi[6], &fi[7],
+            &fi[8], &fi[9],
+            &fi[10], &fi[11], &fi[12], &fi[13], &fi[14], &fi[15]);
+    }
+    else
+    {
+        // "e569f502-8891-4c9f-92d4-51702b158bd5";
+        static constexpr uint8_t DEFAULT_FLOAT_ID[] = {
+            0xe5, 0x69, 0xf5, 0x02,
+            0x88, 0x91,
+            0x4c, 0x9f,
+            0x92, 0xd4,
+            0x51, 0x70, 0x2b, 0x15, 0x8b, 0xd5
+        };
+        std::memcpy(&clientData._flowIdentifier, DEFAULT_FLOAT_ID, sizeof(clientData._flowIdentifier));
+    }
+
     int connectRes = fi_connect(ep._endpoint.get(), adapter._fabricInfo->dest_addr, &clientData, sizeof(clientData));
     if (connectRes != 0)
     {
@@ -289,7 +300,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-        handleConnected(ep, in_cfg._numMessages);
+        handleConnected(ep, serverData._frameSize, in_cfg._numMessages);
     }
 }
 
@@ -298,7 +309,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:I:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:I:f:")) != -1)
     {
         switch (opt)
         {
@@ -316,6 +327,9 @@ int main(int argc, char* argv[])
             break;
         case 'I':
             options._localAddress = optarg;
+            break;
+        case 'f':
+            options._flowId = optarg;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
