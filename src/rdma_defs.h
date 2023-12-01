@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 struct ClientConnection
@@ -45,4 +46,22 @@ struct ServerConnectionFlowV1B : ServerConnectionFlowV1
 {
     /// Size (in bytes) of the frame metadata the server will send.
     std::uint32_t _frameMetadataSize = 0;
+};
+
+inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_REPEATED = 1 << 0;
+inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_KEEP_ALIVE = 1 << 1;
+inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS = 1 << 2;
+inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_FLOW_METADATA = 1 << 3;
+
+struct FrameInformation
+{
+    std::uint64_t _frameIndex;
+    std::uint32_t _bufferUsageCount;
+    std::uint32_t _flags;
+};
+
+struct FrameBufferHeader
+{
+    std::atomic<std::uint32_t> _usageCounter;
+    std::uint32_t _padding[7];
 };

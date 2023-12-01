@@ -54,17 +54,21 @@ enum class WaitResult
 
 void handleConnection(RdmaEndpoint& in_endpoint)
 {
-    static constexpr size_t BUFFER_SIZE = 5 * 1024 * 1024; // 5 MB
+    static constexpr size_t FRAME_SIZE = 5 * 1024 * 1024; // 5 MB
     static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(BUFFER_SIZE);
-    std::memset(buf.get(), 0, BUFFER_SIZE);
+    static constexpr size_t MESSAGE_SIZE = sizeof(FrameInformation) +
+                                           FRAME_SIZE + 
+                                           sizeof(FrameBufferHeader);
+
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(MESSAGE_SIZE);
+    std::memset(buf.get(), 0, MESSAGE_SIZE);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), BUFFER_SIZE, FI_SEND, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), MESSAGE_SIZE, FI_SEND, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -74,10 +78,10 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     in_endpoint.receiveEmptyMessage();
 
     ServerConnectionFlowV1B serverData{};
-    serverData._frameSize = BUFFER_SIZE;
+    serverData._frameSize = FRAME_SIZE;
     serverData._acceptConnectionTime = 1111111;
     serverData._hasActiveProducers = true;
-    serverData._frameMetadataSize = 16;
+    serverData._frameMetadataSize = 0;
     res = fi_accept(in_endpoint._endpoint.get(), &serverData, sizeof(serverData));
     if (res != 0)
     {
@@ -113,6 +117,16 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     int numMessageSent = 0;
     uintptr_t clientId = reinterpret_cast<uintptr_t>(&in_endpoint);
 
+    FrameInformation* fi = reinterpret_cast<FrameInformation*>(buf.get());
+    fi->_frameIndex = 10000 + numMessageSent;
+    fi->_bufferUsageCount = numMessageSent + 1;
+    fi->_flags = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
+
+    FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
+    fbh->_usageCounter = fi->_bufferUsageCount;
+    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + FRAME_SIZE);
+    fbhTail->_usageCounter = fi->_bufferUsageCount;
+
     while (true)
     {
         // Simulate some working being done
@@ -120,7 +134,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
         in_endpoint.receiveEmptyMessage();
 
-        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), BUFFER_SIZE, fi_mr_desc(memoryRegion.get()),
+        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), MESSAGE_SIZE, fi_mr_desc(memoryRegion.get()),
                       FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
@@ -209,8 +223,13 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         }
 
         numMessageSent += 1;
-        std::cout << clientId << ": Message (" << numMessageSent << ", " << BUFFER_SIZE << " bytes) sent to client.\n";
-        std::memset(buf.get(), numMessageSent % 256, BUFFER_SIZE);
+        std::cout << clientId << ": Message (" << numMessageSent << ", " << MESSAGE_SIZE << " bytes) sent to client.\n";
+
+        fi->_frameIndex = 10000 + numMessageSent;
+        fi->_bufferUsageCount = numMessageSent + 1;
+        fi->_flags = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
+        fbh->_usageCounter = fi->_bufferUsageCount;
+        fbhTail->_usageCounter = fi->_bufferUsageCount;
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0U);
@@ -488,7 +507,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    fi_import_log(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), 0, &logger);
+    //fi_import_log(FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION), 0, &logger);
 
     try
     {

@@ -47,15 +47,19 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_maxMessages)
+void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_maxMessages)
 {
     static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(in_messageSize);
+    const size_t messageSize = sizeof(FrameInformation) +
+                               in_frameSize + // contains FrameBufferHeader at the head
+                               sizeof(FrameBufferHeader);
+
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(messageSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), in_messageSize, FI_RECV, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), messageSize, FI_RECV, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -71,7 +75,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_
 
     while (true)
     {
-        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), in_messageSize, fi_mr_desc(memoryRegion.get()),
+        ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), messageSize, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
@@ -83,7 +87,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_
         bool recvCompleted = false, sendCompleted = false;
         std::chrono::milliseconds receiveTimeout = RECEIVE_TIMEOUT;
         std::size_t bytesTransferred = 0;
-        
+
         while (receiveTimeout.count() > 0)
         {
             // Wait for both completions (send+recv) but no more than 2 seconds in total
@@ -108,7 +112,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_
                     waitResult = WaitResult::GOT_MESSAGE;
                     break;
                 }
-                else 
+                else
                 {
                     // We receive first completion notification, adjust completion timeout for 2nd message
                     receiveTimeout -= std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -166,7 +170,22 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_messageSize, int in_
         }
 
         numMessagesReceived += 1;
-        std::cout << "  Got " << numMessagesReceived << " message from the sender: " << bytesTransferred << std::endl;
+
+        FrameInformation* fi = reinterpret_cast<FrameInformation*>(buf.get());
+        FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
+        FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_frameSize);
+
+        std::cout << "  Got " << numMessagesReceived << "th message from the sender: " << bytesTransferred;
+        std::cout << ", frameIndex: " << fi->_frameIndex;
+        std::cout << ", flags: " << fi->_flags;
+
+        if (fbh->_usageCounter != fi->_bufferUsageCount ||
+            fbhTail->_usageCounter  != fi->_bufferUsageCount)
+        {
+            std::cout << " (received message became invalid!)";
+        }
+
+        std::cout << std::endl;
 
         if (in_maxMessages > 0 && numMessagesReceived >= in_maxMessages)
         {
@@ -190,7 +209,7 @@ static bool isConnectionRefused(int in_fiErrorCode)
     {
         return true;
     }
-#endif 
+#endif
     return false;
 }
 
@@ -243,7 +262,7 @@ void run(const AppOptions& in_cfg)
 
     while (!quit)
     {
-        const ssize_t res = fi_eq_sread(ep._eventQueue.get(), &event, entry, maxEntrySize, -1, 0);
+        const ssize_t res = fi_eq_sread(ep._eventQueue.get(), &event, entry, maxEntrySize, 2000, 0);
         if (res < 0)
         {
             if (res == -FI_EAVAIL)
