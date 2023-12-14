@@ -26,6 +26,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <chrono>
+#include <thread>
 
 struct AppOptions
 {
@@ -47,9 +49,21 @@ enum class WaitResult
     TIMEOUT
 };
 
+#ifdef _WIN32
+#define DEBUG_LOG_LOCALTIME(tm, time) ::localtime_s(&tm, &time);
+#else
+#define DEBUG_LOG_LOCALTIME(tm, time) ::localtime_r(&time, &tm);
+#endif
+
 void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_maxMessages)
 {
-    static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::seconds{2};
+    //  0-10
+    // 11-20
+    // 21-30 ...
+    unsigned hist[17] = {};
+
+    static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
+    static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::milliseconds{150};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
@@ -73,7 +87,10 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
     std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
     fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
 
-    while (true)
+    using namespace std::chrono;
+    steady_clock::time_point before = steady_clock::now();
+
+    while (!stopped)
     {
         ssize_t ret = fi_recv(in_endpoint._endpoint.get(), buf.get(), messageSize, fi_mr_desc(memoryRegion.get()),
                               FI_ADDR_UNSPEC, nullptr);
@@ -85,25 +102,31 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
 
         WaitResult waitResult = WaitResult::TIMEOUT;
         bool recvCompleted = false, sendCompleted = false;
-        std::chrono::milliseconds receiveTimeout = RECEIVE_TIMEOUT;
+        milliseconds completionTimeout = SEND_TIMEOUT;
+        uint32_t sendCompletionTimeMs = 0, recvCompletionTimeMs = 0;
         std::size_t bytesTransferred = 0;
 
-        while (receiveTimeout.count() > 0)
+        while (true)
         {
             // Wait for both completions (send+recv) but no more than 2 seconds in total
-            const auto waitingStart = std::chrono::steady_clock::now();
+            auto waitingStart = steady_clock::now();
             fi_cq_msg_entry entry;
-            ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(receiveTimeout.count()));
+            ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(completionTimeout.count()));
             if (ret == 1)
             {
                 if ((entry.flags & SEND_COMPLETION_FLAGS) == SEND_COMPLETION_FLAGS)
                 {
                     sendCompleted = true;
+                    completionTimeout = RECEIVE_TIMEOUT;
+                    sendCompletionTimeMs = duration_cast<milliseconds>(steady_clock::now() - waitingStart).count();
+                    waitingStart = steady_clock::now();
                 }
                 else if ((entry.flags & RECV_COMPLETION_FLAGS) == RECV_COMPLETION_FLAGS)
                 {
                     recvCompleted = true;
                     bytesTransferred = entry.len;
+                    recvCompletionTimeMs = duration_cast<milliseconds>(steady_clock::now() - waitingStart).count();
+                    waitingStart = steady_clock::now();
                 }
 
                 // Both send and receive were completed, we got the message
@@ -112,11 +135,9 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
                     waitResult = WaitResult::GOT_MESSAGE;
                     break;
                 }
-                else
+                else if (recvCompleted) // receive completed first
                 {
-                    // We receive first completion notification, adjust completion timeout for 2nd message
-                    receiveTimeout -= std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - waitingStart);
+                    std::cout << "Receive completed before send?!\n";
                 }
             }
             else if (ret == -FI_EAGAIN)
@@ -163,7 +184,10 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
         {
             if (waitResult == WaitResult::TIMEOUT)
             {
-                std::cout << "Timeout receiving a message from sender\n";
+                std::cout << "Timeout receiving a message from sender (recvCompleted =" << recvCompleted << " ("
+                          << recvCompletionTimeMs << "), sendCompleted = " << sendCompleted << " ("
+                          << sendCompletionTimeMs << ")"
+                          << "\n";
             }
             quit = true;
             break;
@@ -175,9 +199,63 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
         FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
         FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_frameSize);
 
-        std::cout << "  Got " << numMessagesReceived << "th message from the sender: " << bytesTransferred;
+        const auto tp = system_clock::now();
+        const auto millis = duration_cast<milliseconds>(tp.time_since_epoch()).count() % 1000LL;
+        std::time_t time_tt = system_clock::to_time_t(tp);
+        std::tm t{};
+        DEBUG_LOG_LOCALTIME(t, time_tt)
+        char buffer[256];
+        auto len = strftime(buffer, sizeof(buffer), "%H:%M:%S", &t);
+        len += std::sprintf(buffer + len, ".%03u", static_cast<unsigned>(millis));
+
+        const auto now = steady_clock::now();
+        const auto diff = now - before;
+        before = now;
+        const auto diffMs = duration_cast<milliseconds>(diff).count();
+
+        if (diffMs <= 10)
+            ++hist[0];
+        else if (diffMs <= 20)
+            ++hist[1];
+        else if (diffMs <= 20)
+            ++hist[2];
+        else if (diffMs <= 30)
+            ++hist[3];
+        else if (diffMs <= 40)
+            ++hist[4];
+        else if (diffMs <= 50)
+            ++hist[5];
+        else if (diffMs <= 60)
+            ++hist[6];
+        else if (diffMs <= 70)
+            ++hist[7];
+        else if (diffMs <= 80)
+            ++hist[8];
+        else if (diffMs <= 90)
+            ++hist[9];
+        else if (diffMs <= 100)
+            ++hist[10];
+        else if (diffMs <= 110)
+            ++hist[11];
+        else if (diffMs <= 120)
+            ++hist[12];
+        else if (diffMs <= 130)
+            ++hist[13];
+        else if (diffMs <= 140)
+            ++hist[14];
+        else if (diffMs <= 150)
+            ++hist[15];
+        else
+            ++hist[16];
+
+        std::cout << buffer << "  Got " << numMessagesReceived << "th message: " << bytesTransferred;
         std::cout << ", frameIndex: " << fi->_frameIndex;
         std::cout << ", flags: " << fi->_flags;
+        std::cout << ", sendWait: " << sendCompletionTimeMs;
+        std::cout << ", recvWait: " << recvCompletionTimeMs;
+        std::cout << ", diff: " << diffMs;
+        if (diffMs > 40)
+            std::cout << " (!)";
 
         if (fbh->_usageCounter != fi->_bufferUsageCount ||
             fbhTail->_usageCounter  != fi->_bufferUsageCount)
@@ -187,12 +265,20 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
 
         std::cout << std::endl;
 
+        std::this_thread::sleep_for(milliseconds{5});
+
         if (in_maxMessages > 0 && numMessagesReceived >= in_maxMessages)
         {
             std::cout << "Sent " << in_maxMessages << ". Quitting\n";
             quit = true;
             break;
         }
+    }
+
+    std::cout << "Histogram:\n";
+    for (unsigned i = 0u; i < std::size(hist); ++i)
+    {
+        std::cout << "[" << i*10 + (i > 0 ? 1 : 0) << "-" << (i+1) * 10 << "ms]: " << hist[i] << "\n";
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0);
