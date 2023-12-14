@@ -39,6 +39,7 @@ struct AppOptions
     std::string _localAddress{};
     std::string _flowId{};
     int _numMessages{100};
+    int _sleepTime{0};
 };
 
 bool quit = false;
@@ -65,7 +66,7 @@ enum class WaitResult
 #define DEBUG_LOG_LOCALTIME(tm, time) ::localtime_r(&time, &tm);
 #endif
 
-void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_maxMessages)
+void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_maxMessages, int in_sleepTime)
 {
     //  0-10
     // 11-20
@@ -275,7 +276,10 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
 
         std::cout << std::endl;
 
-        std::this_thread::sleep_for(milliseconds{5});
+        if (in_sleepTime > 0)
+        {
+            std::this_thread::sleep_for(milliseconds{in_sleepTime});
+        }
 
         if (in_maxMessages > 0 && numMessagesReceived >= in_maxMessages)
         {
@@ -415,7 +419,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-        handleConnected(ep, serverData._frameSize, in_cfg._numMessages);
+        handleConnected(ep, serverData._frameSize, in_cfg._numMessages, in_cfg._sleepTime);
     }
 }
 
@@ -429,7 +433,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:I:f:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:I:f:s:")) != -1)
     {
         switch (opt)
         {
@@ -450,6 +454,9 @@ int main(int argc, char* argv[])
             break;
         case 'f':
             options._flowId = optarg;
+            break;
+        case 's':
+            options._sleepTime = std::atoi(optarg);
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
