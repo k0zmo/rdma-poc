@@ -15,6 +15,8 @@
 #  include <sys/types.h>
 #endif
 
+#include <signal.h>
+
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -40,6 +42,14 @@ struct AppOptions
 };
 
 bool quit = false;
+std::atomic<bool> stopped = false;
+
+void sighandler(int sig)
+{
+    (void)sig;
+    quit = true;
+    stopped = true;
+}
 
 enum class WaitResult
 {
@@ -411,6 +421,11 @@ void run(const AppOptions& in_cfg)
 
 int main(int argc, char* argv[])
 {
+    signal(SIGINT, &sighandler);
+#ifdef SIGBREAK
+    signal(SIGBREAK, &sighandler);
+#endif
+
     AppOptions options;
 
     int opt;
