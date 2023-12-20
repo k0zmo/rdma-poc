@@ -125,11 +125,11 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
     FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_frameSize);
     fbhTail->_usageCounter = fi->_bufferUsageCount;
 
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+
     while (true)
     {
-        // Simulate some working being done
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
-
         in_endpoint.receiveEmptyMessage();
 
         ret = fi_send(in_endpoint._endpoint.get(), buf.get(), messageSize, fi_mr_desc(memoryRegion.get()),
@@ -141,11 +141,11 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
 
         WaitResult waitResult = WaitResult::TIMEOUT;
         bool nextRecvCompleted = false, sendCompleted = false;
-        std::chrono::milliseconds sendTimeout = SEND_TIMEOUT;
+        milliseconds sendTimeout = SEND_TIMEOUT;
 
         while (sendTimeout.count() > 0)
         {
-            const auto waitingStart = std::chrono::steady_clock::now();
+            const auto waitingStart = steady_clock::now();
             ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(sendTimeout.count()));
             if (ret == 1)
             {
@@ -167,8 +167,7 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
                 else
                 {
                     // We receive first completion notification, adjust completion timeout for 2nd message
-                    sendTimeout -= std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - waitingStart);
+                    sendTimeout -= duration_cast<milliseconds>(steady_clock::now() - waitingStart);
                 }
             }
             else if (ret == -FI_EAGAIN)
@@ -228,6 +227,16 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
         fi->_flags = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
         fbh->_usageCounter = fi->_bufferUsageCount;
         fbhTail->_usageCounter = fi->_bufferUsageCount;
+
+        const auto t2 = steady_clock::now();
+        const auto diff = t2 - now;
+        const auto sleepTime = diff - milliseconds{20};
+        if (sleepTime > milliseconds{1})
+        {
+            // Simulate some working being done
+            std::this_thread::sleep_for(sleepTime);
+        }
+        now = t2;
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0U);
