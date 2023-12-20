@@ -42,6 +42,7 @@ struct AppOptions
     std::string _address{"172.19.41.49"};
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
+    std::uint32_t _frameSize{5 * 1024 * 1024}; // 5MB
 };
 
 enum class WaitResult
@@ -52,23 +53,20 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnection(RdmaEndpoint& in_endpoint)
+void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
 {
-    static constexpr size_t FRAME_SIZE = 5 * 1024 * 1024; // 5 MB
     static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    static constexpr size_t MESSAGE_SIZE = sizeof(FrameInformation) +
-                                           FRAME_SIZE + 
-                                           sizeof(FrameBufferHeader);
+    const auto messageSize = sizeof(FrameInformation) + in_frameSize + sizeof(FrameBufferHeader);
 
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(MESSAGE_SIZE);
-    std::memset(buf.get(), 0, MESSAGE_SIZE);
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(messageSize);
+    std::memset(buf.get(), 0, messageSize);
     std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), MESSAGE_SIZE, FI_SEND, 0, 0, 0,
+    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), messageSize, FI_SEND, 0, 0, 0,
                         makeOutPointer(memoryRegion), nullptr);
     if (res != 0)
     {
@@ -78,7 +76,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
     in_endpoint.receiveEmptyMessage();
 
     ServerConnectionFlowV1B serverData{};
-    serverData._frameSize = FRAME_SIZE;
+    serverData._frameSize = in_frameSize;
     serverData._acceptConnectionTime = 1111111;
     serverData._hasActiveProducers = true;
     serverData._frameMetadataSize = 0;
@@ -124,7 +122,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
     FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
     fbh->_usageCounter = fi->_bufferUsageCount;
-    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + FRAME_SIZE);
+    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_frameSize);
     fbhTail->_usageCounter = fi->_bufferUsageCount;
 
     while (true)
@@ -134,7 +132,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
 
         in_endpoint.receiveEmptyMessage();
 
-        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), MESSAGE_SIZE, fi_mr_desc(memoryRegion.get()),
+        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), messageSize, fi_mr_desc(memoryRegion.get()),
                       FI_ADDR_UNSPEC, nullptr);
         if (ret != 0)
         {
@@ -223,7 +221,7 @@ void handleConnection(RdmaEndpoint& in_endpoint)
         }
 
         numMessageSent += 1;
-        std::cout << clientId << ": Message (" << numMessageSent << ", " << MESSAGE_SIZE << " bytes) sent to client.\n";
+        std::cout << clientId << ": Message (" << numMessageSent << ", " << messageSize << " bytes) sent to client.\n";
 
         fi->_frameIndex = 10000 + numMessageSent;
         fi->_bufferUsageCount = numMessageSent + 1;
@@ -361,8 +359,9 @@ void run(const AppOptions& in_cfg)
                     {
                         try
                         {
-                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}]() mutable -> void {
-                                handleConnection(ep);
+                            const auto frameSize = in_cfg._frameSize;
+                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, frameSize]() mutable -> void {
+                                handleConnection(ep, frameSize);
                             }};
                             th.detach();
                         }
@@ -486,7 +485,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:s:")) != -1)
     {
         switch (opt)
         {
@@ -498,6 +497,9 @@ int main(int argc, char* argv[])
             break;
         case 'p':
             options._providerName = optarg;
+            break;
+        case 's':
+            options._frameSize = (unsigned)std::atoi(optarg);
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
