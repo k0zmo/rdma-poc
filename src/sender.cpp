@@ -43,6 +43,7 @@ struct AppOptions
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
     std::uint32_t _frameSize{5 * 1024 * 1024}; // 5MB
+    int _intervalMs{20};
 };
 
 enum class WaitResult
@@ -53,7 +54,7 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
+void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std::chrono::milliseconds in_interval)
 {
     static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
@@ -126,7 +127,7 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
     fbhTail->_usageCounter = fi->_bufferUsageCount;
 
     using namespace std::chrono;
-    auto now = steady_clock::now();
+    auto nextTimePoint = steady_clock::now() + in_interval;
 
     while (true)
     {
@@ -228,15 +229,8 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize)
         fbh->_usageCounter = fi->_bufferUsageCount;
         fbhTail->_usageCounter = fi->_bufferUsageCount;
 
-        const auto t2 = steady_clock::now();
-        const auto diff = t2 - now;
-        const auto sleepTime = diff - milliseconds{20};
-        if (sleepTime > milliseconds{1})
-        {
-            // Simulate some working being done
-            std::this_thread::sleep_for(sleepTime);
-        }
-        now = t2;
+        std::this_thread::sleep_until(nextTimePoint);
+        nextTimePoint = nextTimePoint + in_interval;
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0U);
@@ -369,8 +363,10 @@ void run(const AppOptions& in_cfg)
                         try
                         {
                             const auto frameSize = in_cfg._frameSize;
-                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, frameSize]() mutable -> void {
-                                handleConnection(ep, frameSize);
+                            const auto intervalMs = in_cfg._intervalMs;
+                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, frameSize,
+                                            interval = std::chrono::milliseconds{intervalMs}]() mutable -> void {
+                                handleConnection(ep, frameSize, interval);
                             }};
                             th.detach();
                         }
@@ -494,7 +490,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:s:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:s:t:")) != -1)
     {
         switch (opt)
         {
@@ -509,6 +505,9 @@ int main(int argc, char* argv[])
             break;
         case 's':
             options._frameSize = (unsigned)std::atoi(optarg);
+            break;
+        case 't':
+            options._intervalMs = std::atoi(optarg);
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
