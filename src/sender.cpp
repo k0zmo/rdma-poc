@@ -44,6 +44,7 @@ struct AppOptions
     std::string _providerName{"verbs"};
     std::uint32_t _frameSize{5 * 1024 * 1024}; // 5MB
     int _intervalMs{20};
+    bool _verbose{false};
 };
 
 enum class WaitResult
@@ -54,7 +55,7 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std::chrono::milliseconds in_interval)
+void handleConnection(RdmaEndpoint& in_endpoint, const AppOptions& in_cfg)
 {
     static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
@@ -62,7 +63,7 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    const auto messageSize = sizeof(FrameInformation) + in_frameSize + sizeof(FrameBufferHeader);
+    const auto messageSize = sizeof(FrameInformation) + in_cfg._frameSize + sizeof(FrameBufferHeader);
 
     std::unique_ptr<char[]> buf = std::make_unique<char[]>(messageSize);
     std::memset(buf.get(), 0, messageSize);
@@ -77,7 +78,7 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std
     in_endpoint.receiveEmptyMessage();
 
     ServerConnectionFlowV1B serverData{};
-    serverData._frameSize = in_frameSize;
+    serverData._frameSize = in_cfg._frameSize;
     serverData._acceptConnectionTime = 1111111;
     serverData._hasActiveProducers = true;
     serverData._frameMetadataSize = 0;
@@ -123,11 +124,11 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std
 
     FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
     fbh->_usageCounter = fi->_bufferUsageCount;
-    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_frameSize);
+    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_cfg._frameSize);
     fbhTail->_usageCounter = fi->_bufferUsageCount;
 
     using namespace std::chrono;
-    auto nextTimePoint = steady_clock::now() + in_interval;
+    auto nextTimePoint = steady_clock::now() + milliseconds{in_cfg._intervalMs};
 
     while (true)
     {
@@ -221,7 +222,10 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std
         }
 
         numMessageSent += 1;
-        std::cout << clientId << ": Message (" << numMessageSent << ", " << messageSize << " bytes) sent to client.\n";
+        if (in_cfg._verbose)
+        {
+            std::cout << clientId << ": Message (" << numMessageSent << ", " << messageSize << " bytes) sent to client.\n";
+        }
 
         fi->_frameIndex = 10000 + numMessageSent;
         fi->_bufferUsageCount = numMessageSent + 1;
@@ -230,7 +234,7 @@ void handleConnection(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, std
         fbhTail->_usageCounter = fi->_bufferUsageCount;
 
         std::this_thread::sleep_until(nextTimePoint);
-        nextTimePoint = nextTimePoint + in_interval;
+        nextTimePoint = nextTimePoint + milliseconds{in_cfg._intervalMs};
     }
 
     fi_shutdown(in_endpoint._endpoint.get(), 0U);
@@ -362,11 +366,8 @@ void run(const AppOptions& in_cfg)
                     {
                         try
                         {
-                            const auto frameSize = in_cfg._frameSize;
-                            const auto intervalMs = in_cfg._intervalMs;
-                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, frameSize,
-                                            interval = std::chrono::milliseconds{intervalMs}]() mutable -> void {
-                                handleConnection(ep, frameSize, interval);
+                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, in_cfg]() mutable -> void {
+                                handleConnection(ep, in_cfg);
                             }};
                             th.detach();
                         }
@@ -490,7 +491,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:s:t:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:s:t:v")) != -1)
     {
         switch (opt)
         {
@@ -508,6 +509,9 @@ int main(int argc, char* argv[])
             break;
         case 't':
             options._intervalMs = std::atoi(optarg);
+            break;
+        case 'v':
+            options._verbose = true;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
