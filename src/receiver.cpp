@@ -40,6 +40,7 @@ struct AppOptions
     std::string _flowId{};
     int _numMessages{100};
     int _sleepTime{0};
+    bool _verbose{false};
 };
 
 bool quit = false;
@@ -66,7 +67,7 @@ enum class WaitResult
 #define DEBUG_LOG_LOCALTIME(tm, time) ::localtime_r(&time, &tm);
 #endif
 
-void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_maxMessages, int in_sleepTime)
+void handleConnected(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, const AppOptions& in_cfg)
 {
     //  0-10
     // 11-20
@@ -74,7 +75,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
     unsigned hist[17] = {};
 
     static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
-    static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::milliseconds{150};
+    static constexpr std::chrono::milliseconds RECEIVE_TIMEOUT = std::chrono::milliseconds{1500};
     static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
     static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
@@ -100,6 +101,8 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
 
     using namespace std::chrono;
     steady_clock::time_point before = steady_clock::now();
+    steady_clock::time_point accDataTp = before;
+    std::uint64_t accDataReceived = 0;
 
     while (!stopped)
     {
@@ -136,6 +139,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
                 {
                     recvCompleted = true;
                     bytesTransferred = entry.len;
+                    accDataReceived += bytesTransferred;
                     recvCompletionTimeMs = duration_cast<milliseconds>(steady_clock::now() - waitingStart).count();
                     waitingStart = steady_clock::now();
                 }
@@ -259,36 +263,51 @@ void handleConnected(RdmaEndpoint& in_endpoint, uint32_t in_frameSize, int in_ma
         else
             ++hist[16];
 
-        std::cout << buffer << "  Got " << numMessagesReceived << "th message: " << bytesTransferred;
-        std::cout << ", frameIndex: " << fi->_frameIndex;
-        std::cout << ", flags: " << fi->_flags;
-        std::cout << ", sendWait: " << sendCompletionTimeMs;
-        std::cout << ", recvWait: " << recvCompletionTimeMs;
-        std::cout << ", diff: " << diffMs;
-        if (diffMs > 40)
-            std::cout << " (!)";
+        const bool invalidMessage =
+            fbh->_usageCounter != fi->_bufferUsageCount ||
+            fbhTail->_usageCounter != fi->_bufferUsageCount;
 
-        if (fbh->_usageCounter != fi->_bufferUsageCount ||
-            fbhTail->_usageCounter  != fi->_bufferUsageCount)
+        if (in_cfg._verbose || diffMs > 40 || invalidMessage)
         {
-            std::cout << " (received message became invalid!)";
+            std::cout << buffer << "  Got " << numMessagesReceived << "th message: " << bytesTransferred;
+            std::cout << ", frameIndex: " << fi->_frameIndex;
+            std::cout << ", flags: " << fi->_flags;
+            std::cout << ", sendWait: " << sendCompletionTimeMs;
+            std::cout << ", recvWait: " << recvCompletionTimeMs;
+            std::cout << ", diff: " << diffMs;
+            if (diffMs > 40)
+                std::cout << " (!)";
+            if (invalidMessage)
+                std::cout << " (received message became invalid!)";
+            std::cout << std::endl;
         }
 
-        std::cout << std::endl;
-
-        if (in_sleepTime > 0)
+        if (now - accDataTp >= seconds{4})
         {
-            std::this_thread::sleep_for(milliseconds{in_sleepTime});
+            const auto accDiff = duration_cast<milliseconds>(now - accDataTp).count();
+            const auto mbps = (accDataReceived * 8ull) / accDiff / 1000;
+            std::cout << "Bandwidth: " << mbps * 0.001 << " Gbps\n";
+            accDataReceived = 0;
+            accDataTp = now;
         }
 
-        if (in_maxMessages > 0 && numMessagesReceived >= in_maxMessages)
+        if (in_cfg._sleepTime > 0)
         {
-            std::cout << "Sent " << in_maxMessages << ". Quitting\n";
+            std::this_thread::sleep_for(milliseconds{in_cfg._sleepTime});
+        }
+
+        if (in_cfg._numMessages > 0 && numMessagesReceived >= in_cfg._numMessages)
+        {
+            std::cout << "Sent " << in_cfg._numMessages << ". Quitting\n";
             quit = true;
             break;
         }
     }
 
+    const auto now = steady_clock::now();
+    const auto accDiff = duration_cast<milliseconds>(now - accDataTp).count();
+    const auto mbps = (accDataReceived * 8ull) / accDiff / 1000;
+    std::cout << "Bandwidth: " << mbps * 0.001 << " Gbps\n";
     std::cout << "Histogram:\n";
     for (unsigned i = 0u; i < std::size(hist); ++i)
     {
@@ -419,7 +438,7 @@ void run(const AppOptions& in_cfg)
                   << "\n  frameSize: " << serverData._frameSize
                   << "\n  acceptConnectionTime: " << serverData._acceptConnectionTime
                   << "\n  hasActiveProducers: " << serverData._hasActiveProducers << std::endl;
-        handleConnected(ep, serverData._frameSize, in_cfg._numMessages, in_cfg._sleepTime);
+        handleConnected(ep, serverData._frameSize, in_cfg);
     }
 }
 
@@ -433,7 +452,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:I:f:s:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:I:f:s:v")) != -1)
     {
         switch (opt)
         {
@@ -457,6 +476,9 @@ int main(int argc, char* argv[])
             break;
         case 's':
             options._sleepTime = std::atoi(optarg);
+            break;
+        case 'v':
+            options._verbose = true;
             break;
         case '?':
             std::cerr << "Unknown option: " << char(optopt) << std::endl;
