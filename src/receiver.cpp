@@ -267,7 +267,7 @@ void handleConnected(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, cons
             fbh->_usageCounter != fi->_bufferUsageCount ||
             fbhTail->_usageCounter != fi->_bufferUsageCount;
 
-        if (in_cfg._verbose || diffMs > 40 || invalidMessage)
+        if (in_cfg._verbose || invalidMessage)
         {
             std::cout << buffer << "  Got " << numMessagesReceived << "th message: " << bytesTransferred;
             std::cout << ", frameIndex: " << fi->_frameIndex;
@@ -275,8 +275,6 @@ void handleConnected(RdmaEndpoint& in_endpoint, std::uint32_t in_frameSize, cons
             std::cout << ", sendWait: " << sendCompletionTimeMs;
             std::cout << ", recvWait: " << recvCompletionTimeMs;
             std::cout << ", diff: " << diffMs;
-            if (diffMs > 40)
-                std::cout << " (!)";
             if (invalidMessage)
                 std::cout << " (received message became invalid!)";
             std::cout << std::endl;
