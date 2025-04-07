@@ -9,7 +9,8 @@
             "generator": "Ninja",
             "cacheVariables": {
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "CMAKE_COLOR_DIAGNOSTICS": "ON"
+                "CMAKE_COLOR_DIAGNOSTICS": "ON",
+                "concurrentqueue_ROOT": "${sourceDir}/vendor/concurrentqueue"
             }
         },
         {

@@ -39,7 +39,7 @@
 
 struct AppOptions
 {
-    std::string _address{};
+    std::string _address{"0.0.0.0"};
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
     std::uint32_t _frameSize{5 * 1024 * 1024}; // 5MB

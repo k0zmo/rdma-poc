@@ -16,6 +16,7 @@
 #include <ws2tcpip.h>
 #endif
 
+#include <cstdint>
 #include <string.h>
 #include <cassert>
 #include <cstdlib>
@@ -24,8 +25,26 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
+
+#define DEBUG_LOG(...)                                                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        using namespace std::chrono;                                                                                   \
+        const auto tp = system_clock::now();                                                                           \
+        const auto millis = duration_cast<milliseconds>(tp.time_since_epoch()).count() % 1000LL;                       \
+        std::time_t time_tt = system_clock::to_time_t(tp);                                                             \
+        std::tm t{};                                                                                                   \
+        ::localtime_r(&time_tt, &t);                                                                                   \
+        char buffer[512];                                                                                              \
+        auto len = strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &t);                                          \
+        len += std::sprintf(buffer + len, ".%03u ", static_cast<unsigned>(millis));                                    \
+        std::sprintf(buffer + len, __VA_ARGS__);                                                                       \
+        std::fprintf(stdout, "%s\n", buffer);                                                                          \
+        std::fflush(stdout);                                                                                           \
+    } while (0);
 
 inline const auto FABRIC_VERSION = FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION);
 
@@ -65,6 +84,8 @@ template <> struct default_delete<fid_pep>    : FabricInterfaceDeleter<fid_pep> 
 template <> struct default_delete<fid_ep>     : FabricInterfaceDeleter<fid_ep> {};
 template <> struct default_delete<fid_cq>     : FabricInterfaceDeleter<fid_cq> {};
 template <> struct default_delete<fid_mr>     : FabricInterfaceDeleter<fid_mr> {};
+template <> struct default_delete<fid_av>     : FabricInterfaceDeleter<fid_av> {};
+template <> struct default_delete<fid_cntr>   : FabricInterfaceDeleter<fid_cntr> {};
 
 } // namespace std
 
@@ -226,6 +247,31 @@ inline std::shared_ptr<fi_info> createFabricInfoHints(const std::string& in_prov
 
     return hints;
 }
+
+inline std::shared_ptr<fi_info> createFabricInfoHintsRdm(const std::string& in_providerName)
+{
+    fi_info* rawHints = fi_allocinfo();
+    if ( !rawHints )
+    {
+        throw rdma_error{"hints is null", -FI_ENOMEM};
+    }
+    std::shared_ptr<fi_info> hints{rawHints, fi_freeinfo};
+
+    if (!in_providerName.empty())
+    {
+        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+    }
+    hints->ep_attr->type = FI_EP_RDM;
+    hints->caps = FI_MSG | FI_RECV | FI_SEND | FI_REMOTE_COMM; // | FI_TAGGED
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
+    hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
+    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+    hints->rx_attr->iov_limit = 4;
+    hints->tx_attr->iov_limit = 4;
+
+    return hints;
+}
+
 
 inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
                                               const std::string& in_destAddress,
@@ -442,3 +488,129 @@ struct RdmaListeningEndpoint
         return maxConnectionDataSize;
     }
 };
+
+struct RdmEndpoint
+{
+    std::shared_ptr<fid_domain> _domain;
+    std::shared_ptr<fid_fabric> _fabric;
+
+    std::unique_ptr<fid_cq>     _completionQueue;
+    std::unique_ptr<fid_av>     _addressVector;
+    std::unique_ptr<fid_ep>     _endpoint; // must be destroyed before anything that binds to it (so EQ, CQ and CNTR)
+    bool                        _cqHasWaitObject = true;
+
+    RdmEndpoint(const RdmaAdapter& in_adapter)
+        : RdmEndpoint(in_adapter, *in_adapter._fabricInfo)
+    {
+    }
+
+    RdmEndpoint(const RdmaAdapter& in_adapter, const fi_info& in_fabricInfo)
+        : _domain{in_adapter._domain}
+        , _fabric{in_adapter._fabric}
+    {
+        assert(in_fabricInfo.ep_attr->type == FI_EP_RDM);
+
+        int res = fi_endpoint(_domain.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_endpoint), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_endpoint", res};
+        }
+        fi_av_attr avAttrs = {};
+        avAttrs.type = in_fabricInfo.domain_attr->av_type;
+        //avAttrs.count = 1;
+        res = fi_av_open(_domain.get(), &avAttrs, makeOutPointer(_addressVector), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_av_open", res};
+        }
+
+        fi_cq_attr cqAttrs = {};
+        cqAttrs.size = in_fabricInfo.tx_attr->size; // We can limit it later, for now use the full capability
+        cqAttrs.wait_obj = FI_WAIT_NONE;
+        cqAttrs.format = FI_CQ_FORMAT_MSG;
+        res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
+        if (res == -FI_ENOSYS)
+        {
+            cqAttrs.wait_obj = FI_WAIT_NONE;
+            res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
+            _cqHasWaitObject = false;
+        }
+        if (res != 0)
+        {
+            throw rdma_error{"fi_cq_open", res};
+        }
+
+        res = fi_ep_bind(_endpoint.get(), toFid(_completionQueue), FI_RECV | FI_SEND);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_ep_bind to CQ", res};
+        }
+        res = fi_ep_bind(_endpoint.get(), toFid(_addressVector), 0);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_ep_bind to AV", res};
+        }
+        // We want to post receive before accepting a connection.
+        res = fi_enable(_endpoint.get());
+        if (res != 0)
+        {
+            throw rdma_error{"fi_enable", res};
+        }
+    }
+};
+
+inline std::string getAddressAsString(const void* in_addr, uint32_t in_addrFormat)
+{
+    switch (in_addrFormat)
+    {
+    case FI_SOCKADDR_IN:
+    {
+        const sockaddr_in* addr = reinterpret_cast<const sockaddr_in*>(in_addr);
+        char buf[INET_ADDRSTRLEN + 1];
+        inet_ntop(AF_INET, &addr->sin_addr, buf, INET_ADDRSTRLEN);
+        return std::string(buf);
+    }
+    case FI_SOCKADDR_IN6:
+    {
+        const sockaddr_in6* addr = reinterpret_cast<const sockaddr_in6*>(in_addr);
+        char buf[INET6_ADDRSTRLEN + 1];
+        inet_ntop(AF_INET6, &addr->sin6_addr, buf, INET6_ADDRSTRLEN);
+        return std::string(buf);
+    }
+    case FI_ADDR_EFA:
+    {
+        // Definition from libfabric sources: prov/efa/src/rdm/efa_rdm_protocol.h
+        struct efa_ep_addr
+        {
+            std::uint8_t raw[16];
+            std::uint16_t qpn;
+            std::uint16_t pad;
+            std::uint32_t qkey;
+        };
+
+        // EFA 'sock' address is an IPv6 (128 bits for address and 16-bits for port) with an additional 32-bit qkey
+        // EFA addresses are not supposed to be human-readable but we need to tell return something stringy on /status request
+
+        char buf[INET6_ADDRSTRLEN + 1];
+        if (!inet_ntop(AF_INET6, in_addr, buf, INET6_ADDRSTRLEN))
+        {
+            throw std::runtime_error("Error calling inet_ntop");
+        }
+        const efa_ep_addr* efa_addr = reinterpret_cast<const efa_ep_addr*>(in_addr);
+        std::stringstream ss;
+        ss << "efa://[" << buf << "]:" << efa_addr->pad << ':' << efa_addr->qkey;
+        return ss.str();
+    }
+    case FI_ADDR_STR: // Address as a null-terminated string
+        return std::string{reinterpret_cast<const char*>(in_addr)};
+    case FI_SOCKADDR_IB:
+        throw std::runtime_error("Unsupported IB address format");
+    }
+
+    throw std::runtime_error("Unsupported address format");
+}
+
+inline std::string getFabricLocalAddressAsString(const fi_info& in_info)
+{
+    return getAddressAsString(in_info.src_addr, in_info.addr_format);
+}

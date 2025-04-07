@@ -5,44 +5,58 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "(Windows) Launch",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}",
-            "args": [],
-            "stopAtEntry": false,
-            "cwd": "${command:cmake.launchTargetDirectory}",
-            "environment": [
-                {
-                    "name": "PATH",
-                    "value": "D:\\Programowanie\\pkgs\\libfabric\\lib\\debug;${env:PATH}"
-                }
-            ],
-            "console": "integratedTerminal"
+            "type": "lldb",
+            "request": "attach",
+            "name": "Attach",
+            "program": "${workspaceFolder}/build/Linux-GCC-Debug/efa_sender"
         },
         {
-            "name": "(gdb) Launch",
-            "type": "cppdbg",
+            "type": "lldb",
             "request": "launch",
+            "name": "Launch",
             "program": "${command:cmake.launchTargetPath}",
-            "args": [],
-            "stopAtEntry": false,
+            "args": [
+                //"-a", "192.168.110.10",
+                //"-p", "efa",
+                //"-B", "4224"
+                //"-a", "127.0.0.1"
+            ],
             "cwd": "${command:cmake.launchTargetDirectory}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "setupCommands": [
-                {
-                    "description": "Enable pretty-printing for gdb",
-                    "text": "-enable-pretty-printing",
-                    "ignoreFailures": true
-                },
-                {
-                    "description": "Set Disassembly Flavor to Intel",
-                    "text": "-gdb-set disassembly-flavor intel",
-                    "ignoreFailures": true
-                }
-            ]
+            "env": {
+                "FI_PROVIDER_PATH": "/opt/libfabric/lib/libfabric"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "EFA sender",
+            "program": "${workspaceFolder}/build/Linux-GCC-Debug/efa_sender",
+            "args": [
+                //"-a", "192.168.110.10",
+                //"-p", "efa",
+                //"-B", "4224"
+                //"-a", "127.0.0.1"
+            ],
+            "cwd": "${workspaceFolder}/build/Linux-GCC-Debug",
+            "env": {
+                "FI_PROVIDER_PATH": "/opt/libfabric/lib/libfabric"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "EFA receiver",
+            "program": "${workspaceFolder}/build/Linux-GCC-Debug/efa_receiver",
+            "args": [
+                //"-a", "192.168.110.10",
+                //"-p", "efa",
+                //"-B", "4224"
+                "-a", "127.0.0.1"
+            ],
+            "cwd": "${workspaceFolder}/build/Linux-GCC-Debug",
+            "env": {
+                "FI_PROVIDER_PATH": "/opt/libfabric/lib/libfabric"
+            }
         }
     ]
 }
