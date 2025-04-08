@@ -17,6 +17,7 @@
 
 #include <signal.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
@@ -33,7 +34,7 @@
 
 struct AppOptions
 {
-    std::string _address{"172.19.41.49"};
+    std::string _address{};
     std::string _port{"8001"};
     std::string _providerName{"verbs"};
     std::string _localAddress{};
@@ -484,6 +485,12 @@ int main(int argc, char* argv[])
         default:
             return 1;
         }
+    }
+
+    if (options._address.empty())
+    {
+        std::cerr << "Address (-a) must be provided" << std::endl;
+        return 1;
     }
 
     try

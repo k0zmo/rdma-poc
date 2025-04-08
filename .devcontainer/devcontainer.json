@@ -1,0 +1,25 @@
+{
+    "name": "Ubuntu 20.04",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "."
+    },
+    "runArgs": [
+        "--privileged",
+        "--network", "host"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "vadimcn.vscode-lldb",
+                "mhutchie.git-graph",
+                "ms-vscode.cmake-tools",
+                "llvm-vs-code-extensions.vscode-clangd",
+                "SteveBushResearch.BuildOutputColorizer"
+            ]
+        }
+    },
+    "containerEnv": {
+        "NINJA_STATUS": "[%r processes, %f/%t @ %o/s : %es] "
+    }
+}

@@ -194,7 +194,10 @@ inline std::shared_ptr<fi_info> createFabricInfoHints(const std::string& in_prov
     }
     std::shared_ptr<fi_info> hints{rawHints, fi_freeinfo};
 
-    hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+    if (!in_providerName.empty())
+    {
+        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+    }
     hints->ep_attr->type = FI_EP_MSG;
     hints->caps = FI_MSG;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
@@ -309,6 +312,8 @@ struct RdmaEndpoint
         : _domain{in_adapter._domain}
         , _fabric{in_adapter._fabric}
     {
+        assert(in_fabricInfo.ep_attr->type == FI_EP_MSG);
+
         int res = fi_endpoint(_domain.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_endpoint), nullptr);
         if (res != 0)
         {
@@ -394,6 +399,8 @@ struct RdmaListeningEndpoint
     RdmaListeningEndpoint(const RdmaAdapter& in_adapter)
         : _fabric{in_adapter._fabric}
     {
+        assert(in_adapter._fabricInfo->ep_attr->type == FI_EP_MSG);
+
         int res = fi_passive_ep(_fabric.get(), in_adapter._fabricInfo.get(), makeOutPointer(_passiveEndpoint), nullptr);
         if (res != 0)
         {
