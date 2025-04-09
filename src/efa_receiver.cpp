@@ -2,11 +2,6 @@
 #include "rdma_types.h"
 #include "getopt.h"
 
-#include <algorithm>
-#include <asio/buffer.hpp>
-#include <asio/ip/address.hpp>
-#include <cstdlib>
-#include <functional>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -16,7 +11,9 @@
 
 #include <moodycamel/blockingconcurrentqueue.h>
 
+#include <asio/buffer.hpp>
 #include <asio/io_context.hpp>
+#include <asio/ip/address.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/signal_set.hpp>
 #include <asio/read.hpp>
@@ -29,9 +26,10 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -59,7 +57,15 @@ struct AppOptions
     bool _verbose{false};
 };
 
-using EngineCompletionFunc = std::function<void()>;
+class EfaProgressCallback
+{
+public:
+    virtual void onCompletion(uint64_t flags, size_t len) = 0;
+    virtual void onError(int errorCode, const std::string& errorMessage) = 0;
+
+protected:
+    ~EfaProgressCallback() = default;
+};
 
 class EfaProgressEngine
 {
@@ -114,7 +120,6 @@ private:
     void threadFunc()
     {
         fi_cq_msg_entry entry[4];
-
         while (true)
         {
             std::unique_lock lock{_mtx};
@@ -131,22 +136,45 @@ private:
                 {
                     for (int i = 0; i < n; ++i)
                     {
-                        const auto ctx = entry[i].op_context;
-                        if (ctx)
+                        if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
                         {
-                            auto* completionFunc = reinterpret_cast<EngineCompletionFunc*>(ctx);
-                            (*completionFunc)();
-                            delete completionFunc;
+                            ctx->onCompletion(entry[i].flags, entry[i].len);
                         }
                     }
                 }
-                // TODO FI_EAVAIL
                 else if (n != -FI_EAGAIN && n != FI_EINTR)
                 {
-                    // TODO:
-                    //fi_cq_readerr
-                    DEBUG_LOG("Polling CQ ERROR");
-                    exit(-1);
+                    fi_cq_err_entry errEntry;
+                    const auto ret = fi_cq_readerr(ep->_completionQueue.get(), &errEntry, 0);
+                    if (ret < 0)
+                    {
+                        if (ret == -FI_EAGAIN)
+                        {
+                            // Could happen if there's another progress engine, polling the same CQ
+                            // We don't do it but let's ignore that warning for now
+                            continue;
+                        }
+
+                        // TODO handle CQ error
+                        DEBUG_LOG("fi_cq_readerr error: %zd on error: %d (%s)", ret, n, fi_strerror(n));
+                        continue;
+                    }
+
+                    std::string errorMessage;
+                    if (errEntry.err_data_size > 0)
+                    {
+                        errorMessage.assign((const char*)errEntry.err_data, errEntry.err_data_size);
+                    }
+
+                    if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(errEntry.op_context))
+                    {
+                        ctx->onError(errEntry.err, errorMessage);
+                    }
+                    else
+                    {
+                        DEBUG_LOG("Error on CQ: %s (code: %d). Message: %s", fi_strerror(errEntry.err), errEntry.err,
+                                  errorMessage.c_str());
+                    }
                 }
             }
         }
@@ -160,7 +188,7 @@ private:
     std::atomic<bool> _stopped{false};
 };
 
-class App : public std::enable_shared_from_this<App>
+class App : public std::enable_shared_from_this<App>, public EfaProgressCallback
 {
 public:
     App(AppOptions options, asio::io_context& ctx, std::shared_ptr<EfaProgressEngine> progressEngine)
@@ -205,13 +233,8 @@ public:
                 throw rdma_error{"fi_mr_reg", res};
             }
 
-            // FIXME: Reuse it? Make it an interface that does not need a cleanup after each operation
-            auto* completionFunc = new EngineCompletionFunc([this]() {
-                _completionQueue.enqueue(0);
-            });
-
             ssize_t result = fi_recv(_endpoint->_endpoint.get(), _frames[i]._payload.get(), _options._frameSize,
-                                     fi_mr_desc(_frames[i]._memoryRegion.get()), FI_ADDR_UNSPEC, completionFunc);
+                                     fi_mr_desc(_frames[i]._memoryRegion.get()), FI_ADDR_UNSPEC, (EfaProgressCallback*)this);
             if (result != 0)
             {
                 throw rdma_error{"fi_recv", static_cast<int>(result)};
@@ -243,6 +266,7 @@ public:
         // TODO: send expected cadence
 
         _progressEngine->addEndpoint(_endpoint);
+        // defer( _progressEngine->removeEndpoint(_endpoint) );
 
         try
         {
@@ -250,6 +274,7 @@ public:
         }
         catch ( ... )
         {
+            
             _progressEngine->removeEndpoint(_endpoint);
             throw;
         }
@@ -260,7 +285,18 @@ public:
     void stop()
     {
         _stopped = true;
-        _completionQueue.enqueue(1);
+        _completionQueue.enqueue(CompletionEntry{0xDEAD, 0});
+    }
+
+private:
+    void onCompletion(uint64_t flags, size_t len) override
+    {
+        _completionQueue.enqueue(CompletionEntry{flags, len});
+    }
+
+    void onError(int errorCode, const std::string& errorMessage) override
+    {
+        DEBUG_LOG("Error: %s (code: %d) - %s", fi_strerror(errorCode), errorCode, errorMessage.c_str());
     }
 
 private:
@@ -272,19 +308,15 @@ private:
         while (!_stopped)
         {
             // Wait on completion
-            int token;
-            _completionQueue.wait_dequeue(token);
-            if (token == 1) // EOS token
+            CompletionEntry entry;
+            _completionQueue.wait_dequeue(entry);
+            if (entry._flags == 0xDEAD) // EOS entry
             {
                 break;
             }
 
-            auto* completionFunc = new EngineCompletionFunc([this]() {
-                _completionQueue.enqueue(0);
-            });
-
             ssize_t result = fi_recv(_endpoint->_endpoint.get(), _frames[frameToRepost]._payload.get(), _options._frameSize,
-                                     fi_mr_desc(_frames[frameToRepost]._memoryRegion.get()), FI_ADDR_UNSPEC, completionFunc);
+                                     fi_mr_desc(_frames[frameToRepost]._memoryRegion.get()), FI_ADDR_UNSPEC, (EfaProgressCallback*)this);
             if (result != 0)
             {
                 throw rdma_error{"fi_recv", static_cast<int>(result)};
@@ -305,7 +337,12 @@ private:
     std::shared_ptr<RdmaAdapter> _adapter;
     std::shared_ptr<RdmEndpoint> _endpoint;
 
-    moodycamel::BlockingConcurrentQueue<int> _completionQueue;
+    struct CompletionEntry
+    {
+        uint64_t _flags;
+        size_t _len;
+    };
+    moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
     struct Frame
     {
@@ -324,7 +361,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:r:I:f:s:v")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:r:s:v")) != -1)
     {
         switch (opt)
         {
@@ -343,9 +380,6 @@ int main(int argc, char* argv[])
         case 'r':
             options._numReceivers = std::atoi(optarg);
             break;
-        //case 'I':
-        //    options._localAddress = optarg;
-        //    break;
         //case 'f':
         //    options._flowId = optarg;
         //    break;
@@ -396,14 +430,14 @@ int main(int argc, char* argv[])
         {
             auto bundle = std::make_unique<Bundle>();
             bundle->app = std::make_unique<App>(options, ctx, progress);
-            bundle->thread = std::thread{[self = bundle->app.get()]() mutable {
+            bundle->thread = std::thread{[self = bundle->app.get(), i]() mutable {
                 try
                 {
                     self->start();
                 }
                 catch (const std::exception& ex)
                 {
-                    DEBUG_LOG("EXCEPTION: %s", ex.what());
+                    DEBUG_LOG("EXCEPTION on receiver[%d]: %s", i, ex.what());
                 }
             }};
             bundles.push_back(std::move(bundle));
