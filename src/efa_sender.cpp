@@ -366,11 +366,12 @@ private:
     };
     moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
+    std::unique_ptr<char[]> _message;
+    std::unique_ptr<fid_mr> _memoryRegion;
+
     std::shared_ptr<RdmaAdapter> _adapter;
     std::shared_ptr<EfaProgressEngine> _progress;
     std::shared_ptr<RdmEndpoint> _endpoint;
-    std::unique_ptr<char[]> _message;
-    std::unique_ptr<fid_mr> _memoryRegion;
     std::thread _sendingThread;
 
     static std::atomic<uint64_t> _key;
