@@ -2,12 +2,7 @@
 #include "rdma_types.h"
 #include "getopt.h"
 
-#include <asio/buffer.hpp>
-#include <asio/completion_condition.hpp>
-#include <asio/ip/address.hpp>
-#include <cassert>
-#include <cstdlib>
-#include <cstring>
+#include <map>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -17,7 +12,10 @@
 
 #include <moodycamel/blockingconcurrentqueue.h>
 
+#include <asio/buffer.hpp>
+#include <asio/completion_condition.hpp>
 #include <asio/io_context.hpp>
+#include <asio/ip/address.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/post.hpp>
 #include <asio/read.hpp>
@@ -31,18 +29,24 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
-#include <system_error>
-#include <thread>
+#include <memory>
+#include <mutex>
 #include <stdlib.h>
 #include <string>
-#include <memory>
+#include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -78,6 +82,199 @@ static std::string getAddressAsString(fid_av& av, const void* addr)
  *   minimum expected size: 4 + 4 + 16 + 16 + 4 + 4 = 48
  */
 
+struct EfaClientConnectionV1
+{
+    uint32_t _addressFormat;
+    uint32_t _addressLength;
+    uint8_t _addressBytes[64];
+    uint8_t _flowId[16];
+    uint32_t _expectedFrameSize;
+    uint32_t _state = 0; // or send credits?
+};
+
+class EfaProgressCallback
+{
+public:
+    virtual void onCompletion(uint64_t flags, size_t len) = 0;
+    virtual void onError(int errorCode) = 0;
+
+protected:
+    ~EfaProgressCallback() = default;
+};
+
+class EfaProgressEngine
+{
+public:
+    EfaProgressEngine()
+        : _workThread{&EfaProgressEngine::threadFunc, this}
+    {
+    }
+
+    EfaProgressEngine(const EfaProgressEngine&) = delete;
+    EfaProgressEngine& operator=(const EfaProgressEngine&) = delete;
+
+    ~EfaProgressEngine()
+    {
+        DEBUG_LOG("~EfaProgressEngine");
+        {
+            std::lock_guard lock{_mtx};
+            _stopped = true;
+        }
+        _condVar.notify_one();
+
+        if (_workThread.joinable())
+        {
+            _workThread.join();
+        }
+    }
+
+    void postWork(const std::shared_ptr<RdmEndpoint> endpoint, uint32_t count = 1)
+    {
+        bool needNotification = false;
+        {
+            std::lock_guard lock{_mtx};
+
+            const auto it =
+                std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
+                    return ep._endpoint == endpoint;
+                });
+            if (it == _endpoints.end())
+            {
+                return;
+            }
+
+            it->_outstandingWork += count;
+            if (_outstandingWork == 0)
+            {
+                needNotification = true;
+            }
+            _outstandingWork += count;
+        }
+        if (needNotification)
+        {
+            _condVar.notify_one();
+        }
+    }
+
+    void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint)
+    {
+        std::lock_guard lock{_mtx};
+        _endpoints.emplace_back(std::move(endpoint));
+    }
+
+    void removeEndpoint(const std::shared_ptr<RdmEndpoint>& endpoint)
+    {
+        std::lock_guard lock{_mtx};
+        auto it = std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
+            return ep._endpoint == endpoint;
+        });
+        if (it != _endpoints.end())
+        {
+            if (it->_outstandingWork > 0)
+            {
+                assert(_outstandingWork >= it->_outstandingWork);
+                _outstandingWork -= it->_outstandingWork;
+            }
+            _endpoints.erase(it);
+        }
+    }
+
+private:
+    void threadFunc()
+    {
+        fi_cq_msg_entry entry[4];
+        while (true)
+        {
+            std::unique_lock lock{_mtx};
+            _condVar.wait(lock, [this] { return _outstandingWork > 0 || _stopped; });
+            if (_stopped)
+            {
+                return;
+            }
+
+            for (auto& ep : _endpoints)
+            {
+                if (ep._outstandingWork == 0)
+                {
+                    continue;
+                }
+                const int n = fi_cq_read(ep._endpoint->_completionQueue.get(), &entry, sizeof(entry)/sizeof(entry[0]));
+                if (n > 0)
+                {
+                    removeOutstandingWorkNoLock(ep, n);
+
+                    for (int i = 0; i < n; ++i)
+                    {
+                        if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
+                        {
+                            // try-catch
+                            ctx->onCompletion(entry[i].flags, entry[i].len);
+                        }
+                    }
+                }
+                else if (n != -FI_EAGAIN && n != FI_EINTR)
+                {
+                    fi_cq_err_entry errEntry;
+                    const auto ret = fi_cq_readerr(ep._endpoint->_completionQueue.get(), &errEntry, 0);
+                    if (ret < 0)
+                    {
+                        if (ret == -FI_EAGAIN)
+                        {
+                            // Could happen if there's another progress engine, polling the same CQ
+                            // We don't do it but let's ignore that warning for now
+                            continue;
+                        }
+
+                        // TODO handle CQ error
+                        DEBUG_LOG("fi_cq_readerr error: %zd on error: %d (%s)", ret, n, fi_strerror(n));
+                        continue;
+                    }
+
+                    removeOutstandingWorkNoLock(ep, 1);
+
+                    if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(errEntry.op_context))
+                    {
+                        // try-catch
+                        ctx->onError(errEntry.err);
+                    }
+                    else
+                    {
+                        DEBUG_LOG("Error on CQ: %s (code: %d)", fi_strerror(errEntry.err), errEntry.err);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    struct Endpoint
+    {
+        Endpoint(std::shared_ptr<RdmEndpoint> endpoint)
+            : _endpoint{std::move(endpoint)}
+            , _outstandingWork{0}
+        {
+        }
+
+        std::shared_ptr<RdmEndpoint> _endpoint;
+        uint32_t _outstandingWork;
+    };
+
+    void removeOutstandingWorkNoLock(Endpoint& endpoint, uint32_t count)
+    {
+        assert(endpoint._outstandingWork >= count);
+        endpoint._outstandingWork -= count;
+        assert(_outstandingWork >= count);
+        _outstandingWork -= count;
+    }
+
+    std::vector<Endpoint> _endpoints;
+    std::mutex _mtx;
+    std::condition_variable _condVar;
+    uint32_t _outstandingWork{0};
+    bool _stopped{false};
+    std::thread _workThread;
+};
+
 template <typename T>
 void copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
 {
@@ -92,22 +289,25 @@ void copyFromBuffer(asio::const_buffer& inout_buf, uint8_t* in_value, size_t in_
     inout_buf += in_length;
 }
 
-class Peer : public std::enable_shared_from_this<Peer>
+class Peer : public std::enable_shared_from_this<Peer>, public EfaProgressCallback
 {
 public:
     Peer(asio::io_context& ctx,
          asio::ip::tcp::socket socket,
          std::shared_ptr<RdmaAdapter> adapter,
+         std::shared_ptr<EfaProgressEngine> progress,
          AppOptions options)
         : _ctx{ctx},
           _socket{std::move(socket)},
           _options{std::move(options)},
-          _adapter{std::move(adapter)}
+          _adapter{std::move(adapter)},
+          _progress{std::move(progress)}
     {
     }
 
     ~Peer()
     {
+        DEBUG_LOG("Peer::~Peer");
         _stopped = true;
         if (_sendingThread.joinable())
             _sendingThread.join();
@@ -123,8 +323,10 @@ public:
 
     void stop()
     {
+        DEBUG_LOG("Peer::stop");
         _stopped = true;
         _socket.cancel();
+        _completionQueue.enqueue({0xDEAD, 0, 0});
         if (_sendingThread.joinable())
             _sendingThread.join();
     }
@@ -191,18 +393,24 @@ private:
 
         _buf.consume(numConsumed);
 
-        try
-        {
-            createRdmEndpoint();
-            createData();
-            startSending();
-        }
-        catch (const std::exception& ex)
-        {
-            DEBUG_LOG("EXCEPTION: %s", ex.what());
-            asio::post(_ctx, [self = shared_from_this()]() { self->stop(); });
-            return;
-        }
+        _sendingThread = std::thread{[self = shared_from_this()]() mutable {
+            try
+            {
+                self->createRdmEndpoint();
+                self->createData();
+                self->sendLoop();
+
+                auto& ctx = self->_ctx; // self is moved before we can pass self->_ctx
+                asio::post(ctx, [self = std::move(self)]() { self->stop(); });
+            }
+            catch (const std::exception& ex)
+            {
+                DEBUG_LOG("EXCEPTION: %s", ex.what());
+                auto& ctx = self->_ctx;
+                asio::post(ctx, [self = std::move(self)]() { self->stop(); });
+                return;
+            }
+        }};
     }
 
     void createRdmEndpoint()
@@ -210,8 +418,10 @@ private:
         _endpoint = std::make_shared<RdmEndpoint>(*_adapter);
 
         auto res = fi_av_insert(_endpoint->_addressVector.get(), _addrBytes.get(), 1, &_addrVector, 0U, nullptr);
-        DEBUG_LOG("fi_av_insert: %d", res);
-        // 1 on correct address, 0 otherwise
+        if (res != 1) // Returns number of addresses inserted
+        {
+            DEBUG_LOG("fi_av_insert: %d", res);
+        }
 
         const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, _addrBytes.get());
         DEBUG_LOG("Peer address: %s", peerAddress.c_str());
@@ -237,12 +447,14 @@ private:
         }
     }
 
-    void startSending()
+    void onCompletion(uint64_t flags, size_t len) override
     {
-        _sendingThread = std::thread{[self = shared_from_this()]() mutable {
-            self->sendLoop();
-            self.reset();
-        }};
+        _completionQueue.enqueue({0, flags, len});
+    }
+
+    void onError(int errorCode) override
+    {
+        _completionQueue.enqueue({errorCode, 0, 0});
     }
 
 /**
@@ -270,56 +482,70 @@ private:
         auto nextTimePoint = steady_clock::now() + milliseconds{_options._intervalMs};
         unsigned numMessageSent = 0;
 
+        _progress->addEndpoint(_endpoint);
+
         while (!_stopped)
         {
             ssize_t result = fi_send(_endpoint->_endpoint.get(), _message.get(), _options._frameSize,
-                                     fi_mr_desc(_memoryRegion.get()), _addrVector, nullptr);
-            if (result != 0)
+                                     fi_mr_desc(_memoryRegion.get()), _addrVector, (EfaProgressCallback*)this);
+            if (result == 0)
+            {
+                _progress->postWork(_endpoint, 1);
+            }
+            else
             {
                 DEBUG_LOG("fi_send result: %zd", result);
             }
+
             if (result == -FI_EAGAIN)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
-
-                // jesli chcemy miec taki "progress", to trzeba miec callbacki bo nie wiadomo kto zostanie tutaj zakonczony
-
-                //fi_cq_msg_entry entry;
-                //fi_cq_read(_endpoint->_completionQueue.get(), &entry, 1);
-
-                // if (providerName.find("ofi_rxm") != std::string::npos || 
-                //     providerName.find("tcp") != std::string::npos)
-                // {
-                //     // Call fi_send again
-                //     // Sprawdzic co robia inni ale chyba wolaja 'progress'
                 continue;
-                // }
             }
             else if (result < 0)
             {
                 break;
             }
-    
-            fi_cq_msg_entry entry;
-            while (true)
+
+            CompletionEntry cqe;
+            _completionQueue.wait_dequeue(cqe);
+            if (cqe.errorCode == 0xDEAD)
             {
-                result = fi_cq_read(_endpoint->_completionQueue.get(), &entry, 1);
-                if (result == 1)
-                {
-                    if (_options._verbose)
-                        DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, entry.flags, entry.len);
-                    break;
-                }
-                else if (_stopped)
-                {
-                    break;
-                }
+                DEBUG_LOG("Received EOS entry");
+                break;
             }
+            else if (cqe.errorCode != 0)
+            {
+                DEBUG_LOG("Error on send: %s (%d)", fi_strerror(cqe.errorCode), cqe.errorCode);
+                break;
+            }
+            else if (_options._verbose)
+            {
+                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, cqe.flags, cqe.len);
+            }
+
+            // fi_cq_msg_entry entry;
+            // while (true)
+            // {
+            //     result = fi_cq_read(_endpoint->_completionQueue.get(), &entry, 1);
+            //     if (result == 1)
+            //     {
+            //         if (_options._verbose)
+            //             DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, entry.flags, entry.len);
+            //         break;
+            //     }
+            //     else if (_stopped)
+            //     {
+            //         break;
+            //     }
+            // }
     
             std::this_thread::sleep_until(nextTimePoint);
             nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
             ++numMessageSent;
         }
+
+        _progress->removeEndpoint(_endpoint);
     }
 
 private:
@@ -334,7 +560,16 @@ private:
     std::unique_ptr<uint8_t[]> _addrBytes;
     fi_addr_t _addrVector;
 
+    struct CompletionEntry
+    {
+        int errorCode;
+        uint64_t flags;
+        size_t len;
+    };
+    moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
+
     std::shared_ptr<RdmaAdapter> _adapter;
+    std::shared_ptr<EfaProgressEngine> _progress;
     std::shared_ptr<RdmEndpoint> _endpoint;
     std::unique_ptr<char[]> _message;
     std::unique_ptr<fid_mr> _memoryRegion;
@@ -369,7 +604,8 @@ public:
         DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*fabricInfo).c_str());
 
         _adapter = std::make_shared<RdmaAdapter>(std::move(fabricInfo));
-    
+        _progress = std::make_shared<EfaProgressEngine>();
+
         // RdmaAdapter adapter{app.fabricInfo};
         _acceptor.open(asio::ip::tcp::v4());
         _acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
@@ -401,7 +637,7 @@ private:
 
                 if (!ec)
                 {
-                    auto peer = std::make_shared<Peer>(_ctx, std::move(socket), _adapter, _options);
+                    auto peer = std::make_shared<Peer>(_ctx, std::move(socket), _adapter, _progress, _options);
                     _peers.push_back(peer);
                     peer->start();
                 }
@@ -416,6 +652,7 @@ private:
     asio::ip::tcp::acceptor _acceptor;
     std::vector<std::weak_ptr<Peer>> _peers;
     std::shared_ptr<RdmaAdapter> _adapter;
+    std::shared_ptr<EfaProgressEngine> _progress;
     bool _stopped = false;
 };
 
