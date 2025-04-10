@@ -2,6 +2,7 @@
 
 #include "rdma_types.h"
 
+#include <cassert>
 #include <rdma/fi_eq.h>
 #include <rdma/fi_errno.h>
 
@@ -18,14 +19,14 @@
 class EfaProgressCallback
 {
 public:
-    virtual void onCompletion(uint64_t flags, size_t len) = 0;
-    virtual void onError(int errorCode)                   = 0;
+    virtual void onCompletion(uint64_t flags, size_t length) noexcept = 0;
+    virtual void onError(int errorCode) noexcept                   = 0;
 
 protected:
     ~EfaProgressCallback() = default;
 };
 
-class EfaProgressEngine
+class EfaProgressEngine final
 {
 public:
     static constexpr uint32_t MAX_COMPLETION_ENTRY_PROGRESS = 4;
@@ -53,27 +54,20 @@ public:
         }
     }
 
-    void postWork(const std::shared_ptr<RdmEndpoint> endpoint, uint32_t count = 1)
+    void postWork(const std::shared_ptr<RdmEndpoint>& endpoint, uint32_t count = 1)
     {
-        bool needNotification = false;
-        {
+        const bool needNotification = [&] {
             std::lock_guard lock{_mtx};
-            const auto it =
-                std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
-                    return ep._endpoint == endpoint;
-                });
+            const auto      it = findEndpoint(endpoint);
             if (it == _endpoints.end())
             {
-                return;
+                return false;
             }
-
             const auto prevOutstandingWork = it->_outstandingWork;
             it->_outstandingWork += count;
-            if (prevOutstandingWork == 0)
-            {
-                needNotification = true;
-            }
-        }
+            return prevOutstandingWork == 0;
+        }();
+
         if (needNotification)
         {
             _condVar.notify_one();
@@ -83,23 +77,33 @@ public:
     void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint, EfaProgressCallback* callback)
     {
         std::lock_guard lock{_mtx};
+        const auto it = findEndpoint(endpoint);
+        if (it != _endpoints.end())
+        {
+            // Already added
+            return;
+        }
         _endpoints.emplace_back(std::move(endpoint), callback);
     }
 
     void removeEndpoint(const std::shared_ptr<RdmEndpoint>& endpoint)
     {
         std::lock_guard lock{_mtx};
-        auto it = std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
-            return ep._endpoint == endpoint;
-        });
+        const auto it = findEndpoint(endpoint);
         if (it != _endpoints.end())
         {
             _endpoints.erase(it);
         }
     }
 
+    size_t getNumEndpoints() const
+    {
+        std::lock_guard lock{_mtx};
+        return _endpoints.size();
+    }
+
 private:
-    uint32_t numOutstandingWorkNoLock() const
+    uint32_t getNumOutstandingWorkNoLock() const
     {
         uint32_t total = 0;
         for (const auto& ep : _endpoints)
@@ -115,7 +119,7 @@ private:
         while (true)
         {
             std::unique_lock lock{_mtx};
-            _condVar.wait(lock, [this] { return numOutstandingWorkNoLock() > 0 || _stopped; });
+            _condVar.wait(lock, [this] { return getNumOutstandingWorkNoLock() > 0 || _stopped; });
             if (_stopped)
             {
                 return;
@@ -135,56 +139,25 @@ private:
 
                     for (int i = 0; i < n; ++i)
                     {
-                        // TODO: add try-catch
-                        ep._callback->onCompletion(entry[i].flags, entry[i].len);
-                        // if (const auto ctx =
-                        //         reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
-                        // {
-                        //     // TODO: add try-catch
-                        //     ctx->onCompletion(entry[i].flags, entry[i].len);
-                        // }
+                        ep._callback->onCompletion(entry[i].flags, entry[i].len);                        
                     }
                 }
-                else if (n != -FI_EAGAIN && n != FI_EINTR)
+                else if (n != -FI_EAGAIN && n != -FI_EINTR)
                 {
                     fi_cq_err_entry errEntry;
                     const auto      ret =
                         fi_cq_readerr(ep._endpoint->_completionQueue.get(), &errEntry, 0);
                     if (ret < 0)
                     {
-                        if (ret == -FI_EAGAIN)
-                        {
-                            // Could happen if there's another progress engine, polling the same CQ
-                            // We don't do it but let's ignore that warning for now
-                            continue;
-                        }
-
-                        // TODO handle CQ error
-                        DEBUG_LOG(
-                            "fi_cq_readerr error: %zd on error: %d (%s)", ret, n, fi_strerror(n));
-                        continue;
+                        // Could happen if there's another progress engine, polling the same CQ
+                        // We don't do it but let's ignore that warning for now.
+                        // Going through the libfabric code, it's the only error that may be
+                        // returned from fi_cq_readerr
+                        assert(ret == -FI_EAGAIN);
                     }
 
                     ep._outstandingWork -= 1;
-
-                    const auto opCtx = errEntry.op_context;
-                    if (opCtx)
-                    {
-                        DEBUG_LOG("Error on CQ: %s (code: %d) %lu %lu",
-                                  fi_strerror(errEntry.err),
-                                  errEntry.err,
-                                  (uintptr_t)ep._callback,
-                                  (uintptr_t)errEntry.op_context);
-
-                        // TODO: add try-catch
-                        //((EfaProgressCallback*)opCtx)->onError(errEntry.err);
-                        ep._callback->onError(errEntry.err);
-                    }
-                    else
-                    {
-                        DEBUG_LOG(
-                            "Error on CQ: %s (code: %d)", fi_strerror(errEntry.err), errEntry.err);
-                    }
+                    ep._callback->onError(errEntry.err);
                 }
             }
         }
@@ -207,7 +180,14 @@ private:
         uint32_t _outstandingWork;
     };
 
-    std::mutex _mtx;
+    std::vector<Endpoint>::iterator findEndpoint(const std::shared_ptr<RdmEndpoint>& endpoint)
+    {
+        return std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
+            return ep._endpoint == endpoint;
+        });
+    }
+
+    mutable std::mutex _mtx;
     std::condition_variable _condVar;
     std::vector<Endpoint> _endpoints;
 

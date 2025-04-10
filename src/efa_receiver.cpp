@@ -173,12 +173,12 @@ public:
     }
 
 private:
-    void onCompletion(uint64_t flags, size_t len) override
+    void onCompletion(uint64_t flags, size_t length) noexcept override
     {
-        _completionQueue.enqueue(CompletionEntry{0, flags, len});
+        _completionQueue.enqueue(CompletionEntry{0, flags, length});
     }
 
-    void onError(int errorCode) override
+    void onError(int errorCode) noexcept override
     {
         _completionQueue.enqueue(CompletionEntry{errorCode, 0, 0});
     }

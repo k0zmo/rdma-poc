@@ -142,7 +142,6 @@ public:
 
     void stop()
     {
-        //DEBUG_LOG("Peer::stop");
         _stopped = true;
         _socket.cancel();
         _completionQueue.enqueue({0xDEAD, 0, 0});
@@ -266,12 +265,12 @@ private:
         }
     }
 
-    void onCompletion(uint64_t flags, size_t len) override
+    void onCompletion(uint64_t flags, size_t length) noexcept override
     {
-        _completionQueue.enqueue({0, flags, len});
+        _completionQueue.enqueue({0, flags, length});
     }
 
-    void onError(int errorCode) override
+    void onError(int errorCode) noexcept override
     {
         _completionQueue.enqueue({errorCode, 0, 0});
     }
@@ -329,22 +328,6 @@ private:
                 ++numMessageSent;
                 DEBUG_LOG("Sent completed: %u [f=%lu l=%zu id=%u]", numMessageSent, cqe.flags, cqe.len, _peerId);
             }
-
-            // fi_cq_msg_entry entry;
-            // while (true)
-            // {
-            //     result = fi_cq_read(_endpoint->_completionQueue.get(), &entry, 1);
-            //     if (result == 1)
-            //     {
-            //         if (_options._verbose)
-            //             DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, entry.flags, entry.len);
-            //         break;
-            //     }
-            //     else if (_stopped)
-            //     {
-            //         break;
-            //     }
-            // }
     
             std::this_thread::sleep_until(nextTimePoint);
             nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
@@ -412,7 +395,6 @@ public:
         _adapter = std::make_shared<RdmaAdapter>(std::move(fabricInfo));
         _progress = std::make_shared<EfaProgressEngine>();
 
-        // RdmaAdapter adapter{app.fabricInfo};
         _acceptor.open(asio::ip::tcp::v4());
         _acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
         _acceptor.bind({asio::ip::tcp::v4(), _options._port});
