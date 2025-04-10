@@ -1,6 +1,6 @@
-#include "rdma_defs.h"
 #include "rdma_types.h"
 #include "getopt.h"
+#include "efa_progress_engine.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -26,16 +26,13 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
-#include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdlib>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <exception>
-#include <mutex>
 #include <system_error>
 #include <thread>
 #include <stdlib.h>
@@ -55,137 +52,6 @@ struct AppOptions
     int _numMessages{100};
     int _numReceivers{1};
     bool _verbose{false};
-};
-
-class EfaProgressCallback
-{
-public:
-    virtual void onCompletion(uint64_t flags, size_t len) = 0;
-    virtual void onError(int errorCode, const std::string& errorMessage) = 0;
-
-protected:
-    ~EfaProgressCallback() = default;
-};
-
-class EfaProgressEngine
-{
-public:
-    EfaProgressEngine()
-        : _workThread{&EfaProgressEngine::threadFunc, this}
-    {
-    }
-
-    EfaProgressEngine(const EfaProgressEngine&) = delete;
-    EfaProgressEngine& operator=(const EfaProgressEngine&) = delete;
-
-    ~EfaProgressEngine()
-    {
-        {
-            std::lock_guard lock{_mtx};
-            _stopped = true;
-        }
-        _condVar.notify_one();
-
-        if (_workThread.joinable())
-        {
-            _workThread.join();
-        }
-    }
-
-    void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint)
-    {
-        std::size_t size = 0;
-        {
-            std::lock_guard lock{_mtx};
-            size = _endpoints.size();
-            _endpoints.push_back(std::move(endpoint));
-        }
-        if (size == 0)
-        {
-            _condVar.notify_one();
-        }
-    }
-
-    void removeEndpoint(std::shared_ptr<RdmEndpoint> endpoint)
-    {
-        std::lock_guard lock{_mtx};
-        auto it = std::find(_endpoints.begin(), _endpoints.end(), endpoint);
-        if (it != _endpoints.end())
-        {
-            _endpoints.erase(it);
-        }
-    }
-
-private:
-    void threadFunc()
-    {
-        fi_cq_msg_entry entry[4];
-        while (true)
-        {
-            std::unique_lock lock{_mtx};
-            _condVar.wait(lock, [this] { return !_endpoints.empty() || _stopped; });
-            if (_stopped)
-            {
-                return;
-            }
-
-            for (auto& ep : _endpoints)
-            {
-                const int n = fi_cq_read(ep->_completionQueue.get(), &entry, sizeof(entry)/sizeof(entry[0]));
-                if (n > 0)
-                {
-                    for (int i = 0; i < n; ++i)
-                    {
-                        if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
-                        {
-                            ctx->onCompletion(entry[i].flags, entry[i].len);
-                        }
-                    }
-                }
-                else if (n != -FI_EAGAIN && n != FI_EINTR)
-                {
-                    fi_cq_err_entry errEntry;
-                    const auto ret = fi_cq_readerr(ep->_completionQueue.get(), &errEntry, 0);
-                    if (ret < 0)
-                    {
-                        if (ret == -FI_EAGAIN)
-                        {
-                            // Could happen if there's another progress engine, polling the same CQ
-                            // We don't do it but let's ignore that warning for now
-                            continue;
-                        }
-
-                        // TODO handle CQ error
-                        DEBUG_LOG("fi_cq_readerr error: %zd on error: %d (%s)", ret, n, fi_strerror(n));
-                        continue;
-                    }
-
-                    std::string errorMessage;
-                    if (errEntry.err_data_size > 0)
-                    {
-                        errorMessage.assign((const char*)errEntry.err_data, errEntry.err_data_size);
-                    }
-
-                    if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(errEntry.op_context))
-                    {
-                        ctx->onError(errEntry.err, errorMessage);
-                    }
-                    else
-                    {
-                        DEBUG_LOG("Error on CQ: %s (code: %d). Message: %s", fi_strerror(errEntry.err), errEntry.err,
-                                  errorMessage.c_str());
-                    }
-                }
-            }
-        }
-    }
-
-private:
-    std::vector<std::shared_ptr<RdmEndpoint>> _endpoints;
-    std::mutex _mtx;
-    std::condition_variable _condVar;
-    std::thread _workThread;
-    std::atomic<bool> _stopped{false};
 };
 
 class App : public std::enable_shared_from_this<App>, public EfaProgressCallback
@@ -268,6 +134,8 @@ public:
         _progressEngine->addEndpoint(_endpoint);
         // defer( _progressEngine->removeEndpoint(_endpoint) );
 
+        _progressEngine->postWork(_endpoint, 2);
+
         try
         {
             receiveLoop();
@@ -285,18 +153,18 @@ public:
     void stop()
     {
         _stopped = true;
-        _completionQueue.enqueue(CompletionEntry{0xDEAD, 0});
+        _completionQueue.enqueue(CompletionEntry{0xDEAD, 0, 0});
     }
 
 private:
     void onCompletion(uint64_t flags, size_t len) override
     {
-        _completionQueue.enqueue(CompletionEntry{flags, len});
+        _completionQueue.enqueue(CompletionEntry{0, flags, len});
     }
 
-    void onError(int errorCode, const std::string& errorMessage) override
+    void onError(int errorCode) override
     {
-        DEBUG_LOG("Error: %s (code: %d) - %s", fi_strerror(errorCode), errorCode, errorMessage.c_str());
+        _completionQueue.enqueue(CompletionEntry{errorCode, 0, 0});
     }
 
 private:
@@ -310,7 +178,7 @@ private:
             // Wait on completion
             CompletionEntry entry;
             _completionQueue.wait_dequeue(entry);
-            if (entry._flags == 0xDEAD) // EOS entry
+            if (entry.errorCode == 0xDEAD) // EOS entry
             {
                 break;
             }
@@ -321,11 +189,12 @@ private:
             {
                 throw rdma_error{"fi_recv", static_cast<int>(result)};
             }
+            _progressEngine->postWork(_endpoint, 1);
             frameToRepost = 1 - frameToRepost;
 
             ++numMessageReceived;
             if (_options._verbose)
-                DEBUG_LOG("Received: %u", numMessageReceived);
+                DEBUG_LOG("Received: %u (%zu bytes)", numMessageReceived, entry.len);
         }
     }
 
@@ -339,8 +208,9 @@ private:
 
     struct CompletionEntry
     {
-        uint64_t _flags;
-        size_t _len;
+        int errorCode;
+        uint64_t flags;
+        size_t len;
     };
     moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 

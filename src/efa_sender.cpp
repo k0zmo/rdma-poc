@@ -1,8 +1,7 @@
-#include "rdma_defs.h"
 #include "rdma_types.h"
 #include "getopt.h"
+#include "efa_progress_engine.h"
 
-#include <map>
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
@@ -29,11 +28,9 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
-#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -42,7 +39,6 @@
 #include <ctime>
 #include <exception>
 #include <memory>
-#include <mutex>
 #include <stdlib.h>
 #include <string>
 #include <system_error>
@@ -90,189 +86,6 @@ struct EfaClientConnectionV1
     uint8_t _flowId[16];
     uint32_t _expectedFrameSize;
     uint32_t _state = 0; // or send credits?
-};
-
-class EfaProgressCallback
-{
-public:
-    virtual void onCompletion(uint64_t flags, size_t len) = 0;
-    virtual void onError(int errorCode) = 0;
-
-protected:
-    ~EfaProgressCallback() = default;
-};
-
-class EfaProgressEngine
-{
-public:
-    EfaProgressEngine()
-        : _workThread{&EfaProgressEngine::threadFunc, this}
-    {
-    }
-
-    EfaProgressEngine(const EfaProgressEngine&) = delete;
-    EfaProgressEngine& operator=(const EfaProgressEngine&) = delete;
-
-    ~EfaProgressEngine()
-    {
-        DEBUG_LOG("~EfaProgressEngine");
-        {
-            std::lock_guard lock{_mtx};
-            _stopped = true;
-        }
-        _condVar.notify_one();
-
-        if (_workThread.joinable())
-        {
-            _workThread.join();
-        }
-    }
-
-    void postWork(const std::shared_ptr<RdmEndpoint> endpoint, uint32_t count = 1)
-    {
-        bool needNotification = false;
-        {
-            std::lock_guard lock{_mtx};
-
-            const auto it =
-                std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
-                    return ep._endpoint == endpoint;
-                });
-            if (it == _endpoints.end())
-            {
-                return;
-            }
-
-            it->_outstandingWork += count;
-            if (_outstandingWork == 0)
-            {
-                needNotification = true;
-            }
-            _outstandingWork += count;
-        }
-        if (needNotification)
-        {
-            _condVar.notify_one();
-        }
-    }
-
-    void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint)
-    {
-        std::lock_guard lock{_mtx};
-        _endpoints.emplace_back(std::move(endpoint));
-    }
-
-    void removeEndpoint(const std::shared_ptr<RdmEndpoint>& endpoint)
-    {
-        std::lock_guard lock{_mtx};
-        auto it = std::find_if(_endpoints.begin(), _endpoints.end(), [&](const Endpoint& ep) {
-            return ep._endpoint == endpoint;
-        });
-        if (it != _endpoints.end())
-        {
-            if (it->_outstandingWork > 0)
-            {
-                assert(_outstandingWork >= it->_outstandingWork);
-                _outstandingWork -= it->_outstandingWork;
-            }
-            _endpoints.erase(it);
-        }
-    }
-
-private:
-    void threadFunc()
-    {
-        fi_cq_msg_entry entry[4];
-        while (true)
-        {
-            std::unique_lock lock{_mtx};
-            _condVar.wait(lock, [this] { return _outstandingWork > 0 || _stopped; });
-            if (_stopped)
-            {
-                return;
-            }
-
-            for (auto& ep : _endpoints)
-            {
-                if (ep._outstandingWork == 0)
-                {
-                    continue;
-                }
-                const int n = fi_cq_read(ep._endpoint->_completionQueue.get(), &entry, sizeof(entry)/sizeof(entry[0]));
-                if (n > 0)
-                {
-                    removeOutstandingWorkNoLock(ep, n);
-
-                    for (int i = 0; i < n; ++i)
-                    {
-                        if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
-                        {
-                            // try-catch
-                            ctx->onCompletion(entry[i].flags, entry[i].len);
-                        }
-                    }
-                }
-                else if (n != -FI_EAGAIN && n != FI_EINTR)
-                {
-                    fi_cq_err_entry errEntry;
-                    const auto ret = fi_cq_readerr(ep._endpoint->_completionQueue.get(), &errEntry, 0);
-                    if (ret < 0)
-                    {
-                        if (ret == -FI_EAGAIN)
-                        {
-                            // Could happen if there's another progress engine, polling the same CQ
-                            // We don't do it but let's ignore that warning for now
-                            continue;
-                        }
-
-                        // TODO handle CQ error
-                        DEBUG_LOG("fi_cq_readerr error: %zd on error: %d (%s)", ret, n, fi_strerror(n));
-                        continue;
-                    }
-
-                    removeOutstandingWorkNoLock(ep, 1);
-
-                    if (const auto ctx = reinterpret_cast<EfaProgressCallback*>(errEntry.op_context))
-                    {
-                        // try-catch
-                        ctx->onError(errEntry.err);
-                    }
-                    else
-                    {
-                        DEBUG_LOG("Error on CQ: %s (code: %d)", fi_strerror(errEntry.err), errEntry.err);
-                    }
-                }
-            }
-        }
-    }
-
-private:
-    struct Endpoint
-    {
-        Endpoint(std::shared_ptr<RdmEndpoint> endpoint)
-            : _endpoint{std::move(endpoint)}
-            , _outstandingWork{0}
-        {
-        }
-
-        std::shared_ptr<RdmEndpoint> _endpoint;
-        uint32_t _outstandingWork;
-    };
-
-    void removeOutstandingWorkNoLock(Endpoint& endpoint, uint32_t count)
-    {
-        assert(endpoint._outstandingWork >= count);
-        endpoint._outstandingWork -= count;
-        assert(_outstandingWork >= count);
-        _outstandingWork -= count;
-    }
-
-    std::vector<Endpoint> _endpoints;
-    std::mutex _mtx;
-    std::condition_variable _condVar;
-    uint32_t _outstandingWork{0};
-    bool _stopped{false};
-    std::thread _workThread;
 };
 
 template <typename T>
@@ -457,25 +270,6 @@ private:
         _completionQueue.enqueue({errorCode, 0, 0});
     }
 
-/**
- * When attempting to execute an OFI operation we need to handle
- * resource overrun cases. When a call to an OFI OP fails with -FI_EAGAIN
- * the OFI mtl/btl will attempt to progress any pending Completion Queue
- * events that may prevent additional operations to be enqueued.
- * If the call to ofi progress is successful, then the function call
- * will be retried.
- */
- #define OFI_RETRY_UNTIL_DONE(FUNC, RETURN)             \
- do {                                               \
-     do {                                           \
-         RETURN = FUNC;                             \
-         if (OPAL_LIKELY(0 == RETURN)) {break;}     \
-         if (OPAL_LIKELY(RETURN == -FI_EAGAIN)) {   \
-             opal_progress();                       \
-         }                                          \
-     } while (OPAL_LIKELY(-FI_EAGAIN == RETURN));   \
- } while (0);
-
     void sendLoop()
     {
         using namespace std::chrono;
@@ -630,20 +424,22 @@ public:
 private:
     void acceptNext()
     {
-        _acceptor.async_accept(
-            [this](std::error_code ec, asio::ip::tcp::socket socket) {
-                if (_stopped)
-                    return;
+        _acceptor.async_accept([this](std::error_code ec, asio::ip::tcp::socket socket) {
+            if (_stopped)
+            {
+                return;
+            }
 
-                if (!ec)
-                {
-                    auto peer = std::make_shared<Peer>(_ctx, std::move(socket), _adapter, _progress, _options);
-                    _peers.push_back(peer);
-                    peer->start();
-                }
+            if (!ec)
+            {
+                auto peer =
+                    std::make_shared<Peer>(_ctx, std::move(socket), _adapter, _progress, _options);
+                _peers.push_back(peer);
+                peer->start();
+            }
 
-                acceptNext();
-            });
+            acceptNext();
+        });
     }
 
 private:
