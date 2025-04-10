@@ -102,8 +102,11 @@ void copyFromBuffer(asio::const_buffer& inout_buf, uint8_t* in_value, size_t in_
     inout_buf += in_length;
 }
 
+static unsigned PeerId = 0;
+
 class Peer : public std::enable_shared_from_this<Peer>, public EfaProgressCallback
 {
+    unsigned _peerId;
 public:
     Peer(asio::io_context& ctx,
          asio::ip::tcp::socket socket,
@@ -116,6 +119,7 @@ public:
           _adapter{std::move(adapter)},
           _progress{std::move(progress)}
     {
+        _peerId = ++PeerId;
     }
 
     ~Peer()
@@ -315,7 +319,7 @@ private:
             }
             else if (_options._verbose)
             {
-                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, cqe.flags, cqe.len);
+                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu id=%u]", numMessageSent, cqe.flags, cqe.len, _peerId);
             }
 
             // fi_cq_msg_entry entry;

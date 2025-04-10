@@ -54,14 +54,19 @@ struct AppOptions
     bool _verbose{false};
 };
 
+static unsigned PeerId = 0;
+
 class App : public std::enable_shared_from_this<App>, public EfaProgressCallback
 {
+    unsigned _peerId;
 public:
     App(AppOptions options, asio::io_context& ctx, std::shared_ptr<EfaProgressEngine> progressEngine)
         : _options{std::move(options)},
           _ctx{ctx},
           _progressEngine{std::move(progressEngine)}
-    {}
+    {
+        _peerId = ++PeerId;
+    }
 
     void start()
     {
@@ -194,7 +199,7 @@ private:
 
             ++numMessageReceived;
             if (_options._verbose)
-                DEBUG_LOG("Received: %u (%zu bytes)", numMessageReceived, entry.len);
+                DEBUG_LOG("Received: %u (%zu bytes id=%u)", numMessageReceived, entry.len, _peerId);
         }
     }
 
