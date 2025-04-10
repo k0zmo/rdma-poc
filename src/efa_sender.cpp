@@ -319,6 +319,7 @@ private:
             }
             else if (_options._verbose)
             {
+                ++numMessageSent;
                 DEBUG_LOG("Sent completed: %u [f=%lu l=%zu id=%u]", numMessageSent, cqe.flags, cqe.len, _peerId);
             }
 
@@ -340,7 +341,6 @@ private:
     
             std::this_thread::sleep_until(nextTimePoint);
             nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
-            ++numMessageSent;
         }
 
         _progress->removeEndpoint(_endpoint);
