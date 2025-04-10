@@ -120,6 +120,8 @@ public:
           _progress{std::move(progress)}
     {
         _peerId = ++PeerId;
+
+        DEBUG_LOG("Peer::Peer this=%lu", (uintptr_t)this);
     }
 
     ~Peer()
@@ -140,7 +142,7 @@ public:
 
     void stop()
     {
-        DEBUG_LOG("Peer::stop");
+        //DEBUG_LOG("Peer::stop");
         _stopped = true;
         _socket.cancel();
         _completionQueue.enqueue({0xDEAD, 0, 0});
@@ -257,7 +259,7 @@ private:
     {
         _message = std::make_unique<char[]>(_options._frameSize);
         const auto res = fi_mr_reg(_adapter->_domain.get(), _message.get(), _options._frameSize, FI_SEND, 0, _key++, 0,
-                                   makeOutPointer(_memoryRegion), nullptr);
+                                   makeOutPointer(_memoryRegion), (EfaProgressCallback*)this);
         if (res != 0)
         {
             throw rdma_error{"fi_mr_reg", res};
@@ -280,7 +282,7 @@ private:
         auto nextTimePoint = steady_clock::now() + milliseconds{_options._intervalMs};
         unsigned numMessageSent = 0;
 
-        _progress->addEndpoint(_endpoint);
+        _progress->addEndpoint(_endpoint, this);
 
         while (!_stopped)
         {
@@ -306,7 +308,12 @@ private:
             }
 
             CompletionEntry cqe;
-            _completionQueue.wait_dequeue(cqe);
+            const bool gotEntry = _completionQueue.wait_dequeue_timed(cqe, 1'000 * 2000); // 200 ms
+            if (!gotEntry)
+            {
+                DEBUG_LOG("Timeout waiting for completion");
+                break;
+            }
             if (cqe.errorCode == 0xDEAD)
             {
                 DEBUG_LOG("Received EOS entry");

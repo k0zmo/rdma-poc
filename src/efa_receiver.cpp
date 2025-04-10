@@ -136,7 +136,7 @@ public:
         // send expected frame size
         // TODO: send expected cadence
 
-        _progressEngine->addEndpoint(_endpoint);
+        _progressEngine->addEndpoint(_endpoint, this);
         // defer( _progressEngine->removeEndpoint(_endpoint) );
 
         _progressEngine->postWork(_endpoint, 2);
@@ -152,7 +152,18 @@ public:
             throw;
         }
 
-        _progressEngine->removeEndpoint(_endpoint);        
+        _progressEngine->removeEndpoint(_endpoint);
+        
+        // This flushes all unsend/received data, we need buffers/mrs to be alive
+        _endpoint.reset();
+
+        for (auto& frame : _frames)
+        {
+            frame._memoryRegion.reset();
+            frame._payload.reset();
+        }
+
+        _adapter.reset();
     }
 
     void stop()
@@ -208,9 +219,6 @@ private:
     asio::io_context& _ctx;
     const std::shared_ptr<EfaProgressEngine> _progressEngine;
 
-    std::shared_ptr<RdmaAdapter> _adapter;
-    std::shared_ptr<RdmEndpoint> _endpoint;
-
     struct CompletionEntry
     {
         int errorCode;
@@ -219,12 +227,17 @@ private:
     };
     moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
+    std::shared_ptr<RdmaAdapter> _adapter;
+
     struct Frame
     {
         std::unique_ptr<fid_mr> _memoryRegion;
         std::unique_ptr<char[]> _payload;
     };
     Frame _frames[2];
+
+    std::shared_ptr<RdmEndpoint> _endpoint;
+
     std::atomic<bool> _stopped = false;
 };
 

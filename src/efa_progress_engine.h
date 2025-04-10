@@ -80,10 +80,10 @@ public:
         }
     }
 
-    void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint)
+    void addEndpoint(std::shared_ptr<RdmEndpoint> endpoint, EfaProgressCallback* callback)
     {
         std::lock_guard lock{_mtx};
-        _endpoints.emplace_back(std::move(endpoint));
+        _endpoints.emplace_back(std::move(endpoint), callback);
     }
 
     void removeEndpoint(const std::shared_ptr<RdmEndpoint>& endpoint)
@@ -135,12 +135,14 @@ private:
 
                     for (int i = 0; i < n; ++i)
                     {
-                        if (const auto ctx =
-                                reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
-                        {
-                            // try-catch
-                            ctx->onCompletion(entry[i].flags, entry[i].len);
-                        }
+                        // TODO: add try-catch
+                        ep._callback->onCompletion(entry[i].flags, entry[i].len);
+                        // if (const auto ctx =
+                        //         reinterpret_cast<EfaProgressCallback*>(entry[i].op_context))
+                        // {
+                        //     // TODO: add try-catch
+                        //     ctx->onCompletion(entry[i].flags, entry[i].len);
+                        // }
                     }
                 }
                 else if (n != -FI_EAGAIN && n != FI_EINTR)
@@ -165,11 +167,18 @@ private:
 
                     ep._outstandingWork -= 1;
 
-                    if (const auto ctx =
-                            reinterpret_cast<EfaProgressCallback*>(errEntry.op_context))
+                    const auto opCtx = errEntry.op_context;
+                    if (opCtx)
                     {
-                        // try-catch
-                        ctx->onError(errEntry.err);
+                        DEBUG_LOG("Error on CQ: %s (code: %d) %lu %lu",
+                                  fi_strerror(errEntry.err),
+                                  errEntry.err,
+                                  (uintptr_t)ep._callback,
+                                  (uintptr_t)errEntry.op_context);
+
+                        // TODO: add try-catch
+                        //((EfaProgressCallback*)opCtx)->onError(errEntry.err);
+                        ep._callback->onError(errEntry.err);
                     }
                     else
                     {
@@ -184,13 +193,17 @@ private:
 private:
     struct Endpoint
     {
-        Endpoint(std::shared_ptr<RdmEndpoint> endpoint)
+        Endpoint(std::shared_ptr<RdmEndpoint> endpoint, EfaProgressCallback* callback)
             : _endpoint{std::move(endpoint)}
+            , _callback{callback}
             , _outstandingWork{0}
         {
+            _ccc = uintptr_t(_callback);
         }
 
         std::shared_ptr<RdmEndpoint> _endpoint;
+        EfaProgressCallback* _callback;
+        uintptr_t _ccc;
         uint32_t _outstandingWork;
     };
 
