@@ -65,3 +65,48 @@ struct FrameBufferHeader
     std::atomic<std::uint32_t> _usageCounter;
     std::uint32_t _padding[7];
 };
+
+enum class EfaControlMessageType : std::uint16_t
+{
+    CLIENT_CONNECT_V1,
+    CLIENT_SHUTDOWN_V1,
+    SERVER_ACCEPT_V1,
+    SERVER_REJECT_V1
+};
+
+struct EfaControlMessageHeader
+{
+    std::uint16_t         _length;
+    EfaControlMessageType _type;
+};
+
+template <typename Payload>
+struct EfaControlMessage : EfaControlMessageHeader
+{
+    Payload _payload;
+};
+
+struct EfaClientConnectV1
+{
+    std::uint16_t _addressFormat      = 0;
+    std::uint16_t _addressLength      = 0;
+    std::uint8_t  _addressBytes[64]   = {};
+    std::uint8_t  _flowIdentifier[16] = {};
+    std::uint32_t _expectedFrameSize  = 0;
+};
+
+struct EfaClientShutdownV1
+{
+};
+
+struct EfaServerRejectV1
+{
+    char _errorMessage[128];
+};
+
+struct EfaServerAcceptV1
+{
+    std::uint32_t _frameSize            = 0;
+    std::uint64_t _acceptConnectionTime = 0;
+    bool          _hasActiveProducers   = false;
+};

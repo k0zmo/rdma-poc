@@ -1,4 +1,5 @@
 #include "rdma_types.h"
+#include "rdma_defs.h"
 #include "getopt.h"
 #include "efa_progress_engine.h"
 
@@ -22,22 +23,25 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 
 #include <atomic>
-#include <cstdlib>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <exception>
-#include <system_error>
-#include <thread>
+#include <memory>
 #include <stdlib.h>
 #include <string>
-#include <memory>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -53,6 +57,56 @@ struct AppOptions
     int _numReceivers{1};
     bool _verbose{false};
 };
+
+template <int Name>
+class BaseTimeoutOption
+{
+public:
+    explicit BaseTimeoutOption(std::chrono::milliseconds timeout)
+        : _timeout{}
+    {
+#if defined(_WIN32)
+        _timeout = (uint32_t)timeout.count();
+#else
+        _timeout.tv_sec = (long)(std::chrono::duration_cast<std::chrono::seconds>(timeout).count());
+        _timeout.tv_usec = (long)(timeout.count() % 1000);
+#endif
+    }
+
+    template <typename Protocol>
+    int level(const Protocol&) const
+    {
+        return SOL_SOCKET;
+    }
+
+    template <typename Protocol>
+    int name(const Protocol&) const
+    {
+        return Name;
+    }
+
+    template <typename Protocol>
+    const void* data(const Protocol&) const
+    {
+        return &_timeout;
+    }
+
+    template <typename Protocol>
+    std::size_t size(const Protocol&) const
+    {
+        return sizeof(_timeout);
+    }
+
+private:
+#if defined(_WIN32)
+    uint32_t _timeout;
+#else
+    struct timeval _timeout;
+#endif
+};
+
+using SendTimeoutOption = BaseTimeoutOption<SO_SNDTIMEO>;
+using RecvTimeoutOption = BaseTimeoutOption<SO_RCVTIMEO>;
 
 static unsigned PeerId = 0;
 
@@ -115,25 +169,29 @@ public:
         // FIXME: resolver?
         asio::ip::tcp::endpoint senderEp{asio::ip::make_address(_options._address), _options._port};
         asio::ip::tcp::socket socket{_ctx, asio::ip::tcp::v4()};
-        socket.connect(senderEp);
-
+        socket.set_option(SendTimeoutOption{std::chrono::milliseconds(1000)});
+        socket.set_option(RecvTimeoutOption{std::chrono::milliseconds(1000)});
         socket.set_option(asio::ip::tcp::no_delay(true));
 
-        const uint32_t addrFormat1 = _adapter->_fabricInfo->addr_format;
-        const uint32_t addrLen1 = addrLen;
-        asio::write(socket, asio::buffer(&addrFormat1, sizeof(addrFormat1)));
-        asio::write(socket, asio::buffer(&addrLen1, sizeof(addrLen1)));
-        asio::write(socket, asio::buffer(addrBytes, addrLen1));
+        socket.connect(senderEp);
 
-        char flowId[16];
-        const uint32_t expectedFrameSize = _options._frameSize;
-        const uint32_t state = 0;
+        EfaControlMessage<EfaClientConnectV1> connectMessage;
+        connectMessage._length = sizeof(connectMessage);
+        connectMessage._type = EfaControlMessageType::CLIENT_CONNECT_V1;
+        connectMessage._payload._addressFormat = (uint16_t)_adapter->_fabricInfo->addr_format;
+        connectMessage._payload._addressLength = (uint16_t)addrLen;
+        if (addrLen > sizeof(connectMessage._payload._addressBytes))
+        {
+            throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
+        }
+        memcpy(&connectMessage._payload._addressBytes, addrBytes, addrLen);
+        // connectMessage._payload._flowIdentifier = ...
+        connectMessage._payload._expectedFrameSize = _options._frameSize;
 
-        asio::write(socket, asio::buffer(flowId, sizeof(flowId)));
-        asio::write(socket, asio::buffer(&expectedFrameSize, sizeof(expectedFrameSize)));
-        asio::write(socket, asio::buffer(&state, sizeof(state)));
+        asio::write(socket, asio::buffer(&connectMessage, sizeof(connectMessage)));
+        //asio::read(socket, )
 
-        // send expected frame size
+        // TODO: read response asio::read();
         // TODO: send expected cadence
 
         _progressEngine->addEndpoint(_endpoint, this);

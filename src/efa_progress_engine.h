@@ -26,6 +26,19 @@ protected:
     ~EfaProgressCallback() = default;
 };
 
+// alternative names: EfaCompletionPoller, a ProgressEngine moze byc czyms wyzej
+// wtedy jaka nazwa na EfaProgress? EfaCompletionSource
+
+// class EfaProgress
+// {
+// public:
+//     virtual ~EfaProgress() = default;
+//     virtual void                         onCompletion(uint64_t flags, size_t length) noexcept = 0;
+//     virtual void                         onError(int errorCode) noexcept                      = 0;
+//     virtual std::shared_ptr<RdmEndpoint> getEndpoint()                                        = 0;
+//     virtual std::shared_ptr<fid_cq>      getCompletionQueue()                                 = 0;
+// };
+
 class EfaProgressEngine final
 {
 public:

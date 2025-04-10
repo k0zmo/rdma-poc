@@ -1,4 +1,5 @@
 #include "rdma_types.h"
+#include "rdma_defs.h"
 #include "getopt.h"
 #include "efa_progress_engine.h"
 
@@ -24,6 +25,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sstream>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -66,40 +68,13 @@ static std::string getAddressAsString(fid_av& av, const void* addr)
     return res ? std::string{buf, len} : std::string{};
 }
 
-/*
- * client:
- *   u32 addrFormat
- *   u32 addrLength // minimum 16 for sockaddr
- *   u8 addrBytes[addrLength]
- *   u8 flowIdentifier[16];
- *   u32 expectedFrameSize;
- *   u32 state; // paused/sending
- *
- *   minimum expected size: 4 + 4 + 16 + 16 + 4 + 4 = 48
- */
-
-struct EfaClientConnectionV1
-{
-    uint32_t _addressFormat;
-    uint32_t _addressLength;
-    uint8_t _addressBytes[64];
-    uint8_t _flowId[16];
-    uint32_t _expectedFrameSize;
-    uint32_t _state = 0; // or send credits?
-};
-
 template <typename T>
-void copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
+size_t copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
 {
     static_assert(std::is_trivially_copy_assignable_v<T>, "");
     std::memcpy(&in_value, inout_buf.data(), sizeof(T));
     inout_buf += sizeof(T);
-}
-
-void copyFromBuffer(asio::const_buffer& inout_buf, uint8_t* in_value, size_t in_length)
-{
-    std::memcpy(in_value, inout_buf.data(), in_length);
-    inout_buf += in_length;
+    return sizeof(T);
 }
 
 static unsigned PeerId = 0;
@@ -108,16 +83,16 @@ class Peer : public std::enable_shared_from_this<Peer>, public EfaProgressCallba
 {
     unsigned _peerId;
 public:
-    Peer(asio::io_context& ctx,
-         asio::ip::tcp::socket socket,
-         std::shared_ptr<RdmaAdapter> adapter,
+    Peer(asio::io_context&                  ctx,
+         asio::ip::tcp::socket              socket,
+         std::shared_ptr<RdmaAdapter>       adapter,
          std::shared_ptr<EfaProgressEngine> progress,
-         AppOptions options)
-        : _ctx{ctx},
-          _socket{std::move(socket)},
-          _options{std::move(options)},
-          _adapter{std::move(adapter)},
-          _progress{std::move(progress)}
+         AppOptions                         options) :
+        _ctx{ctx},
+        _socket{std::move(socket)},
+        _options{std::move(options)},
+        _adapter{std::move(adapter)},
+        _progress{std::move(progress)}
     {
         _peerId = ++PeerId;
 
@@ -134,9 +109,11 @@ public:
 
     void start()
     {
-        asio::async_read(_socket, _buf.prepare(512), asio::transfer_at_least(48),
+        asio::async_read(_socket,
+                         _dynamicBuf.prepare(1024),
+                         asio::transfer_at_least(sizeof(EfaControlMessage<EfaClientConnectV1>)),
                          [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
-                             self->onAddrFormatAndLengthReceived(errorCode, bytesXfer);
+                             self->onClientRequestReceived(errorCode, bytesXfer);
                          });
     }
 
@@ -150,66 +127,86 @@ public:
     }
 
 private:
-    void onAddrFormatAndLengthReceived(const std::error_code& errorCode, size_t bytesXfer)
+    void rejectConnection(const std::string& message)
     {
-        if (_stopped)
-            return;
-
-        if (errorCode)
+        if (message.size() > sizeof(_rejectMessage._payload._errorMessage) - 1)
         {
-            DEBUG_LOG("Error reading client requiest: %s", errorCode.message().c_str());
-            return;
+            std::string truncatedMessage{message};
+            truncatedMessage.resize(sizeof(_rejectMessage._payload._errorMessage) - 1);
+            strncpy(_rejectMessage._payload._errorMessage,
+                    truncatedMessage.c_str(),
+                    truncatedMessage.size());
         }
-        
-        if (bytesXfer < 48)
+        else
         {
-            DEBUG_LOG("Received too small message: %zu", bytesXfer);
-            return;
+            strncpy(_rejectMessage._payload._errorMessage, message.c_str(), message.size());
         }
+        _rejectMessage._type   = EfaControlMessageType::SERVER_REJECT_V1;
+        _rejectMessage._length = sizeof(_rejectMessage);
 
-        _buf.commit(bytesXfer);
-        asio::const_buffer buf = _buf.data();
+        asio::async_write(_socket,
+                          asio::buffer(&_rejectMessage, sizeof(_rejectMessage)),
+                          [self = shared_from_this()](const std::error_code&, size_t) {
+                              return; // Let the connection die on its own
+                          });
+    }
 
-        copyFromBuffer(buf, _addrFormat);
-        copyFromBuffer(buf, _addrLen);
+    void acceptConnection()
+    {
+        _acceptMessage._type                          = EfaControlMessageType::SERVER_ACCEPT_V1;
+        _acceptMessage._length                        = sizeof(_acceptMessage);
+        _acceptMessage._payload._acceptConnectionTime = 1111111;
+        _acceptMessage._payload._frameSize            = _options._frameSize;
+        _acceptMessage._payload._hasActiveProducers   = true;
 
-        if (_addrFormat != _adapter->_fabricInfo->addr_format)
+        asio::async_write(_socket,
+                          asio::buffer(&_acceptMessage, sizeof(_acceptMessage)),
+                          [self = shared_from_this()](const std::error_code&, size_t) {});
+    }
+
+    bool handleClientConnect(size_t messageSize, asio::const_buffer payloadBuf)
+    {
+        // TODO: STATE
+        if (_clientConnect._addressFormat != 0) // We've already process connect request
         {
-            DEBUG_LOG("Address format mismatch - %u vs %u\n", _addrFormat, _adapter->_fabricInfo->addr_format);
-            return;
+            rejectConnection("EfaClientConnectV1 message already handled");
+            stop();
+            return false;
         }
-        if (_addrLen > 256)
+
+        if (messageSize != sizeof(EfaControlMessage<EfaClientConnectV1>))
         {
-            DEBUG_LOG("Address length is too big: %u", _addrLen);
-            return;
+            rejectConnection("EfaClientConnectV1 message size differs");
+            return false;
         }
 
-        if (buf.size() < _addrLen + 16 + 4 + 4)
+        const auto consumed = copyFromBuffer(payloadBuf, /*inout*/_clientConnect);
+        _dynamicBuf.consume(consumed);
+
+        if (_clientConnect._addressFormat != _adapter->_fabricInfo->addr_format)
         {
-            // We need more data
-            asio::async_read(_socket, _buf.prepare(512), asio::transfer_at_least(48 - 16 + _addrLen),
-                             [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
-                                 self->onAddrFormatAndLengthReceived(errorCode, bytesXfer);
-                             });
-            return;
+            std::stringstream ss;
+            ss << "Invalid address format, must be " << (uint32_t)_adapter->_fabricInfo->addr_format;
+            rejectConnection(ss.str());
+            return false;
+        }
+        if (_clientConnect._addressLength > sizeof(_clientConnect._addressBytes))
+        {
+            std::stringstream ss;
+            ss << "Invalid address length, can't be greater than " << sizeof(_clientConnect._addressBytes);
+            rejectConnection(ss.str());
+            return false;
+        }
+        if (_clientConnect._expectedFrameSize != 0 &&
+            _clientConnect._expectedFrameSize != _options._frameSize)
+        {
+            std::stringstream ss;
+            ss << "Expected frame size is different than the actual one: " << _options._frameSize;
+            rejectConnection(ss.str());
+            return false;
         }
 
-        _addrBytes = std::make_unique<uint8_t[]>(_addrLen);
-        copyFromBuffer(buf, _addrBytes.get(), _addrLen);
-
-        assert(buf.size() >= 16 + 4 + 4);
-
-        // std::memcpy(&_flowId, buf.data(), 16);
-        // buf += 16;
-        // std::memcpy(&_expectedFrameSize, buf.data(), 4);
-        // buf += 4;
-        // std::memcpy(&_state, buf.data(), 4);
-        // buf += 4;
-
-        const auto numConsumed = reinterpret_cast<const uint8_t*>(buf.data()) - 
-                                 reinterpret_cast<const uint8_t*>(_buf.data().data());
-
-        _buf.consume(numConsumed);
+        acceptConnection();
 
         _sendingThread = std::thread{[self = shared_from_this()]() mutable {
             try
@@ -229,19 +226,100 @@ private:
                 return;
             }
         }};
+
+        return messageSize;
+    }
+
+    bool handleClientShutdown(size_t messageSize, asio::const_buffer payloadBuf)
+    {
+        (void)messageSize;
+        (void)payloadBuf;
+        stop();
+        return false;
+    }
+
+    void onClientRequestReceived(const std::error_code& errorCode, size_t bytesXfer)
+    {
+        if (_stopped)
+            return;
+
+        if (errorCode)
+        {
+            DEBUG_LOG("Error reading client requiest: %s", errorCode.message().c_str());
+            stop();
+            return;
+        }
+
+        assert(bytesXfer >= sizeof(EfaControlMessageHeader));
+        
+        _dynamicBuf.commit(bytesXfer);
+        asio::const_buffer buf = _dynamicBuf.data();
+        const auto numBytesInBuf = buf.size();
+
+        // Read size and tag of the control message
+        EfaControlMessageHeader header;
+        copyFromBuffer(buf, /*inout*/header);
+
+        if (header._length > numBytesInBuf)
+        {
+            // Read more data from the socket. We already have `numBytesInBuf` bytes in the
+            // streambuf from the total of `header._length`. Read the remaining bytes. Because
+            // header's length is u16, we dont really need to protect ourselves from too huge values
+            // and reading 4GB of data from socket in the worst case scenario.
+            asio::async_read(_socket,
+                             _dynamicBuf.prepare(header._length),
+                             asio::transfer_at_least(header._length - numBytesInBuf),
+                             [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
+                                 self->onClientRequestReceived(errorCode, bytesXfer);
+                             });
+            return;
+        }
+
+        _dynamicBuf.consume(sizeof(EfaControlMessageHeader));
+
+        // At this point the message should be complete
+        switch (header._type)
+        {
+        case EfaControlMessageType::CLIENT_CONNECT_V1:
+            if (!handleClientConnect(header._length, buf))
+            {
+                return; // Don't read more requests
+            }
+            break;
+        case EfaControlMessageType::CLIENT_SHUTDOWN_V1:
+            if (!handleClientShutdown(header._length, buf))
+            {
+                return; // Don't read more requests
+            }
+            break;
+        case EfaControlMessageType::SERVER_ACCEPT_V1:
+        case EfaControlMessageType::SERVER_REJECT_V1:
+            DEBUG_LOG("Invalid control message: %hu, closing connection", (uint16_t)header._type);
+            return; // Protocol fatal error
+        default:
+            DEBUG_LOG("Unsupported control message: %hu, skipping", (uint16_t)header._type);
+            break;
+        }
+        
+        asio::async_read(_socket,
+                         _dynamicBuf.prepare(1024),
+                         asio::transfer_at_least(sizeof(EfaControlMessageHeader)),
+                         [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
+                             self->onClientRequestReceived(errorCode, bytesXfer);
+                         });
     }
 
     void createRdmEndpoint()
     {
         _endpoint = std::make_shared<RdmEndpoint>(*_adapter);
 
-        auto res = fi_av_insert(_endpoint->_addressVector.get(), _addrBytes.get(), 1, &_addrVector, 0U, nullptr);
+        auto res = fi_av_insert(_endpoint->_addressVector.get(), _clientConnect._addressBytes, 1, &_addrVector, 0U, nullptr);
         if (res != 1) // Returns number of addresses inserted
         {
             DEBUG_LOG("fi_av_insert: %d", res);
         }
 
-        const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, _addrBytes.get());
+        const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, _clientConnect._addressBytes);
         DEBUG_LOG("Peer address: %s", peerAddress.c_str());
 
         char addrBuf[128]{};
@@ -282,6 +360,7 @@ private:
         unsigned numMessageSent = 0;
 
         _progress->addEndpoint(_endpoint, this);
+        unsigned attempts = 0;
 
         while (!_stopped)
         {
@@ -290,6 +369,7 @@ private:
             if (result == 0)
             {
                 _progress->postWork(_endpoint, 1);
+                attempts = 0;
             }
             else
             {
@@ -298,6 +378,12 @@ private:
 
             if (result == -FI_EAGAIN)
             {
+                attempts++;
+                if (attempts > 100)
+                {
+                    DEBUG_LOG("fi_send: EAGAIN");
+                    break;
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 continue;
             }
@@ -326,7 +412,7 @@ private:
             else if (_options._verbose)
             {
                 ++numMessageSent;
-                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu id=%u]", numMessageSent, cqe.flags, cqe.len, _peerId);
+                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu id=%u]", numMessageSent, cqe.flags, cqe.length, _peerId);
             }
     
             std::this_thread::sleep_until(nextTimePoint);
@@ -341,18 +427,19 @@ private:
     asio::ip::tcp::socket _socket;
     const AppOptions _options;
 
-    asio::streambuf _buf;
+    asio::streambuf _dynamicBuf;
 
-    uint32_t _addrFormat = 0;
-    uint32_t _addrLen = 0;
-    std::unique_ptr<uint8_t[]> _addrBytes;
+    EfaControlMessage<EfaServerRejectV1> _rejectMessage;
+    EfaControlMessage<EfaServerAcceptV1> _acceptMessage;
+    EfaClientConnectV1 _clientConnect;
+
     fi_addr_t _addrVector;
 
     struct CompletionEntry
     {
         int errorCode;
         uint64_t flags;
-        size_t len;
+        size_t length;
     };
     moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
