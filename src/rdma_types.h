@@ -57,7 +57,10 @@ struct FabricInterfaceDeleter
         if (in_pointer)
         {
             int res = fi_close(&in_pointer->fid);
-            assert(res == 0); (void) res;
+            if (res != 0)
+            {
+                DEBUG_LOG("fi_close failed: %s (%d)", fi_strerror(res), res);
+            }
         }
     }
 };

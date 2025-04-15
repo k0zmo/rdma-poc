@@ -210,6 +210,14 @@ public:
             throw;
         }
 
+        DEBUG_LOG("Sending shutdown");
+
+        EfaControlMessage<EfaClientShutdownV1> shutdownMessage;
+        shutdownMessage._length = sizeof(shutdownMessage);
+        shutdownMessage._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
+        asio::write(socket, asio::buffer(&shutdownMessage, sizeof(shutdownMessage)));
+        socket.close();
+
         _progressEngine->removeEndpoint(_endpoint);
         
         // This flushes all unsend/received data, we need buffers/mrs to be alive
@@ -251,7 +259,12 @@ private:
         {
             // Wait on completion
             CompletionEntry entry;
-            _completionQueue.wait_dequeue(entry);
+            const bool gotEntry = _completionQueue.wait_dequeue_timed(entry, 1'000 * 2000); // 200 ms
+            if (!gotEntry)
+            {
+                DEBUG_LOG("Timeout waiting for completion");
+                break;
+            }
             if (entry.errorCode == 0xDEAD) // EOS entry
             {
                 break;

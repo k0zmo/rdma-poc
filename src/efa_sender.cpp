@@ -232,6 +232,7 @@ private:
 
     bool handleClientShutdown(size_t messageSize, asio::const_buffer payloadBuf)
     {
+        DEBUG_LOG("Received shutdown request");
         (void)messageSize;
         (void)payloadBuf;
         stop();
