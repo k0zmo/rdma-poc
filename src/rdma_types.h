@@ -267,8 +267,9 @@ inline std::shared_ptr<fi_info> createFabricInfoHintsRdm(const std::string& in_p
     hints->ep_attr->type = FI_EP_RDM;
     hints->caps = FI_MSG | FI_RECV | FI_SEND | FI_REMOTE_COMM; // | FI_TAGGED
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-    hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
-    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+    hints->domain_attr->progress = FI_PROGRESS_MANUAL;
+    // Check FI_THREAD_COMPLETION after https://github.com/ofiwg/libfabric/pull/10939 is merged
+    hints->domain_attr->threading = FI_THREAD_SAFE;
     hints->rx_attr->iov_limit = 4;
     hints->tx_attr->iov_limit = 4;
 

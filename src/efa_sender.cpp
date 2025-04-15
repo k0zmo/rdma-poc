@@ -85,13 +85,13 @@ class Peer : public std::enable_shared_from_this<Peer>, public EfaProgressCallba
 public:
     Peer(asio::io_context&                  ctx,
          asio::ip::tcp::socket              socket,
-         std::shared_ptr<RdmaAdapter>       adapter,
+         std::shared_ptr<fi_info>           fabricInfo,
          std::shared_ptr<EfaProgressEngine> progress,
          AppOptions                         options) :
         _ctx{ctx},
         _socket{std::move(socket)},
         _options{std::move(options)},
-        _adapter{std::move(adapter)},
+        _adapter{std::make_shared<RdmaAdapter>(std::move(fabricInfo))},
         _progress{std::move(progress)}
     {
         _peerId = ++PeerId;
@@ -434,6 +434,8 @@ private:
     EfaControlMessage<EfaServerAcceptV1> _acceptMessage;
     EfaClientConnectV1 _clientConnect;
 
+    std::shared_ptr<RdmaAdapter> _adapter;
+
     fi_addr_t _addrVector;
 
     struct CompletionEntry
@@ -446,8 +448,6 @@ private:
 
     std::unique_ptr<char[]> _message;
     std::unique_ptr<fid_mr> _memoryRegion;
-
-    std::shared_ptr<RdmaAdapter> _adapter;
     std::shared_ptr<EfaProgressEngine> _progress;
     std::shared_ptr<RdmEndpoint> _endpoint;
     std::thread _sendingThread;
@@ -471,16 +471,14 @@ public:
     {
         // TODO: go through all fi_info (->next) and create EfaAdapter from all of them
         std::shared_ptr<fi_info> hints = createFabricInfoHintsRdm("");
-        std::shared_ptr<fi_info> fabricInfo;
-        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(fabricInfo));
-        if (res != 0 || !fabricInfo)
+        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(_fabricInfo));
+        if (res != 0 || !_fabricInfo)
         {
             throw rdma_error{"fi_getinfo", res};
         }
-        DEBUG_LOG("Provider: %s", fabricInfo->fabric_attr->prov_name);
-        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*fabricInfo).c_str());
+        DEBUG_LOG("Provider: %s", _fabricInfo->fabric_attr->prov_name);
+        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*_fabricInfo).c_str());
 
-        _adapter = std::make_shared<RdmaAdapter>(std::move(fabricInfo));
         _progress = std::make_shared<EfaProgressEngine>();
 
         _acceptor.open(asio::ip::tcp::v4());
@@ -515,7 +513,7 @@ private:
             if (!ec)
             {
                 auto peer =
-                    std::make_shared<Peer>(_ctx, std::move(socket), _adapter, _progress, _options);
+                    std::make_shared<Peer>(_ctx, std::move(socket), _fabricInfo, _progress, _options);
                 _peers.push_back(peer);
                 peer->start();
             }
@@ -529,7 +527,7 @@ private:
     asio::io_context& _ctx;
     asio::ip::tcp::acceptor _acceptor;
     std::vector<std::weak_ptr<Peer>> _peers;
-    std::shared_ptr<RdmaAdapter> _adapter;
+    std::shared_ptr<fi_info> _fabricInfo;
     std::shared_ptr<EfaProgressEngine> _progress;
     bool _stopped = false;
 };
