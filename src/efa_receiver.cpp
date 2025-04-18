@@ -51,10 +51,10 @@ struct AppOptions
     std::uint16_t _port{8002};
     std::string _providerName{""};
     std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
-//    std::string _localAddress{};
 //    std::string _flowId{};
     int _numMessages{100};
     int _numReceivers{1};
+    int _numProgressEngines{1};
     bool _verbose{false};
 };
 
@@ -320,7 +320,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:r:s:v")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:r:s:N:v")) != -1)
     {
         switch (opt)
         {
@@ -345,6 +345,9 @@ int main(int argc, char* argv[])
         case 's':
            options._frameSize = std::atoi(optarg);
            break;
+            case 'N':
+                options._numProgressEngines = std::atoi(optarg);
+            break;
         case 'v':
            options._verbose = true;
            break;
@@ -365,7 +368,11 @@ int main(int argc, char* argv[])
     try
     {
         asio::io_context ctx;
-        auto progress = std::make_shared<EfaProgressEngine>();
+        std::vector<std::shared_ptr<EfaProgressEngine>> progressEngines;
+        for (int i = 0; i < options._numProgressEngines; ++i)
+        {
+            progressEngines.push_back(std::make_shared<EfaProgressEngine>());
+        }
 
         struct Bundle
         {
@@ -385,10 +392,12 @@ int main(int argc, char* argv[])
                 b->app->stop();
         });
 
-        for (int i = 0; i < options._numReceivers; ++i)
+        for (int i = 0, p = 0; i < options._numReceivers; ++i)
         {
             auto bundle = std::make_unique<Bundle>();
-            bundle->app = std::make_unique<App>(options, ctx, progress);
+            DEBUG_LOG("CREATING APP [%d] with PROGRESS [%d]", i, p);
+            bundle->app = std::make_unique<App>(options, ctx, progressEngines[p]);
+            p = (p + 1) % options._numProgressEngines;
             bundle->thread = std::thread{[self = bundle->app.get(), i]() mutable {
                 try
                 {

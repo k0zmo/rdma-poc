@@ -56,6 +56,7 @@ struct AppOptions
     std::string _providerName{""};
 //    std::string _flowId{};
     std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
+    int _numProgressEngines{1};
     int _intervalMs{20}; // 50p
     bool _verbose{false};
 };
@@ -479,7 +480,11 @@ public:
         DEBUG_LOG("Provider: %s", _fabricInfo->fabric_attr->prov_name);
         DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*_fabricInfo).c_str());
 
-        _progress = std::make_shared<EfaProgressEngine>();
+        _progressEngines.reserve(_options._numProgressEngines);
+        for (int i = 0; i < _options._numProgressEngines; ++i)
+        {
+            _progressEngines.push_back(std::make_shared<EfaProgressEngine>());
+        }
 
         _acceptor.open(asio::ip::tcp::v4());
         _acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
@@ -512,8 +517,12 @@ private:
 
             if (!ec)
             {
-                auto peer =
-                    std::make_shared<Peer>(_ctx, std::move(socket), _fabricInfo, _progress, _options);
+                auto peer              = std::make_shared<Peer>(_ctx,
+                                                   std::move(socket),
+                                                   _fabricInfo,
+                                                   _progressEngines[_currentProgressEngine],
+                                                   _options);
+                _currentProgressEngine = (_currentProgressEngine + 1) % _options._numProgressEngines;
                 _peers.push_back(peer);
                 peer->start();
             }
@@ -528,7 +537,8 @@ private:
     asio::ip::tcp::acceptor _acceptor;
     std::vector<std::weak_ptr<Peer>> _peers;
     std::shared_ptr<fi_info> _fabricInfo;
-    std::shared_ptr<EfaProgressEngine> _progress;
+    std::vector<std::shared_ptr<EfaProgressEngine>> _progressEngines;
+    int _currentProgressEngine = 0;
     bool _stopped = false;
 };
 
@@ -540,7 +550,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:f:vs:t:")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:f:vs:N:t:")) != -1)
     {
         switch (opt)
         {
@@ -565,6 +575,9 @@ int main(int argc, char* argv[])
         case 't':
             options._intervalMs = std::atoi(optarg);
             break;
+        case 'N':
+            options._numProgressEngines = std::atoi(optarg);
+           break;
         case '?':
             std::fprintf(stderr, "Unknown option: %c\n", opt);
             return 1;
