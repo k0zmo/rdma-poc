@@ -53,6 +53,8 @@ inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_KEEP_ALIVE = 1 << 1;
 inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS = 1 << 2;
 inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_FLOW_METADATA = 1 << 3;
 
+inline constexpr std::uint8_t PROTOCOL_VERSION  = 1;
+
 struct FrameInformation
 {
     std::uint64_t _frameIndex;
@@ -66,8 +68,9 @@ struct FrameBufferHeader
     std::uint32_t _padding[7];
 };
 
-enum class EfaControlMessageType : std::uint16_t
+enum class EfaControlMessageType : std::uint8_t
 {
+    INVALID,
     CLIENT_CONNECT_V1,
     CLIENT_SHUTDOWN_V1,
     SERVER_ACCEPT_V1,
@@ -76,23 +79,19 @@ enum class EfaControlMessageType : std::uint16_t
 
 struct EfaControlMessageHeader
 {
-    std::uint16_t         _length;
-    EfaControlMessageType _type;
-};
-
-template <typename Payload>
-struct EfaControlMessage : EfaControlMessageHeader
-{
-    Payload _payload;
+    std::uint8_t          _protocolVersion = PROTOCOL_VERSION;
+    EfaControlMessageType _type            = EfaControlMessageType::INVALID;
+    std::uint16_t         _length          = 0;
 };
 
 struct EfaClientConnectV1
 {
-    std::uint16_t _addressFormat      = 0;
-    std::uint16_t _addressLength      = 0;
-    std::uint8_t  _addressBytes[64]   = {};
-    std::uint8_t  _flowIdentifier[16] = {};
-    std::uint32_t _expectedFrameSize  = 0;
+    std::uint16_t _addressFormat           = 0;
+    std::uint16_t _addressLength           = 0;
+    std::uint8_t  _sourceAddressBytes[64]  = {};
+    std::uint8_t  _destAddressBytes[64]    = {};
+    std::uint8_t  _flowIdentifier[16]      = {};
+    bool          _wantsFrameMetadata      = false;
 };
 
 struct EfaClientShutdownV1
@@ -107,6 +106,7 @@ struct EfaServerRejectV1
 struct EfaServerAcceptV1
 {
     std::uint32_t _frameSize            = 0;
+    std::uint32_t _frameMetadataSize    = 0;
     std::uint64_t _acceptConnectionTime = 0;
     bool          _hasActiveProducers   = false;
 };

@@ -191,21 +191,21 @@ private:
             rejectConnection(ss.str());
             return false;
         }
-        if (_clientConnect._addressLength > sizeof(_clientConnect._addressBytes))
+        if (_clientConnect._addressLength > sizeof(_clientConnect._destAddressBytes))
         {
             std::stringstream ss;
-            ss << "Invalid address length, can't be greater than " << sizeof(_clientConnect._addressBytes);
+            ss << "Invalid address length, can't be greater than " << sizeof(_clientConnect._destAddressBytes);
             rejectConnection(ss.str());
             return false;
         }
-        if (_clientConnect._expectedFrameSize != 0 &&
-            _clientConnect._expectedFrameSize != _options._frameSize)
-        {
-            std::stringstream ss;
-            ss << "Expected frame size is different than the actual one: " << _options._frameSize;
-            rejectConnection(ss.str());
-            return false;
-        }
+        // if (_clientConnect._expectedFrameSize != 0 &&
+        //     _clientConnect._expectedFrameSize != _options._frameSize)
+        // {
+        //     std::stringstream ss;
+        //     ss << "Expected frame size is different than the actual one: " << _options._frameSize;
+        //     rejectConnection(ss.str());
+        //     return false;
+        // }
 
         acceptConnection();
 
@@ -315,13 +315,13 @@ private:
     {
         _endpoint = std::make_shared<RdmEndpoint>(*_adapter);
 
-        auto res = fi_av_insert(_endpoint->_addressVector.get(), _clientConnect._addressBytes, 1, &_addrVector, 0U, nullptr);
+        auto res = fi_av_insert(_endpoint->_addressVector.get(), _clientConnect._destAddressBytes, 1, &_addrVector, 0U, nullptr);
         if (res != 1) // Returns number of addresses inserted
         {
             DEBUG_LOG("fi_av_insert: %d", res);
         }
 
-        const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, _clientConnect._addressBytes);
+        const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, _clientConnect._destAddressBytes);
         DEBUG_LOG("Peer address: %s", peerAddress.c_str());
 
         char addrBuf[128]{};

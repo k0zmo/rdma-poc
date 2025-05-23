@@ -29,6 +29,7 @@
 #include <sys/types.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -48,10 +49,10 @@
 struct AppOptions
 {
     std::string _address{""};
-    std::uint16_t _port{8002};
+    std::uint16_t _port{16002};
     std::string _providerName{""};
     std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
-//    std::string _flowId{};
+    std::string _flowId{};
     int _numMessages{100};
     int _numReceivers{1};
     int _numProgressEngines{1};
@@ -109,6 +110,25 @@ using SendTimeoutOption = BaseTimeoutOption<SO_SNDTIMEO>;
 using RecvTimeoutOption = BaseTimeoutOption<SO_RCVTIMEO>;
 
 static unsigned PeerId = 0;
+
+template <typename T>
+size_t copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
+{
+    static_assert(std::is_trivially_copy_assignable_v<T>, "");
+    std::memcpy(&in_value, inout_buf.data(), sizeof(T));
+    inout_buf += sizeof(T);
+    return sizeof(T);
+}
+
+template <typename T>
+size_t copyFromStreambuf(asio::streambuf& inout_buf, T& in_value)
+{
+    static_assert(std::is_trivially_copy_assignable_v<T>, "");
+    auto buf = *inout_buf.data().begin();
+    const auto size = copyFromBuffer(buf, /*inout*/in_value);
+    inout_buf.consume(size);
+    return sizeof(T);
+}
 
 class App : public std::enable_shared_from_this<App>, public EfaProgressCallback
 {
@@ -175,24 +195,121 @@ public:
 
         socket.connect(senderEp);
 
-        EfaControlMessage<EfaClientConnectV1> connectMessage;
-        connectMessage._length = sizeof(connectMessage);
-        connectMessage._type = EfaControlMessageType::CLIENT_CONNECT_V1;
-        connectMessage._payload._addressFormat = (uint16_t)_adapter->_fabricInfo->addr_format;
-        connectMessage._payload._addressLength = (uint16_t)addrLen;
-        if (addrLen > sizeof(connectMessage._payload._addressBytes))
+        EfaClientConnectV1 connectMessage;
+        EfaControlMessageHeader sendHeader;
+        sendHeader._length = sizeof(connectMessage);
+        sendHeader._type = EfaControlMessageType::CLIENT_CONNECT_V1;
+        connectMessage._addressFormat = (uint16_t)_adapter->_fabricInfo->addr_format;
+        connectMessage._addressLength = (uint16_t)addrLen;
+        if (addrLen > sizeof(connectMessage._destAddressBytes))
         {
             throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
         }
-        memcpy(&connectMessage._payload._addressBytes, addrBytes, addrLen);
-        // connectMessage._payload._flowIdentifier = ...
-        connectMessage._payload._expectedFrameSize = _options._frameSize;
+        memcpy(&connectMessage._destAddressBytes, addrBytes, addrLen);
+        memcpy(&connectMessage._sourceAddressBytes, addrBytes, addrLen);
+        connectMessage._wantsFrameMetadata = false;
 
-        asio::write(socket, asio::buffer(&connectMessage, sizeof(connectMessage)));
-        //asio::read(socket, )
+        if (!_options._flowId.empty())
+        {
+            auto& fi = connectMessage._flowIdentifier;
+            (void)std::sscanf( // Dont bother validating it
+                _options._flowId.c_str(),
+                "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx%"
+                "02hhx%02hhx%02hhx%02hhx",
+                &fi[0],
+                &fi[1],
+                &fi[2],
+                &fi[3],
+                &fi[4],
+                &fi[5],
+                &fi[6],
+                &fi[7],
+                &fi[8],
+                &fi[9],
+                &fi[10],
+                &fi[11],
+                &fi[12],
+                &fi[13],
+                &fi[14],
+                &fi[15]);
+        }
 
-        // TODO: read response asio::read();
-        // TODO: send expected cadence
+        std::array<asio::const_buffer, 2> sendBufs = {
+            asio::buffer(&sendHeader, sizeof(sendHeader)),
+            asio::buffer(&connectMessage, sizeof(connectMessage))
+        };
+        asio::write(socket, sendBufs);
+
+        asio::streambuf sb;
+        size_t n = asio::read(socket, sb.prepare(sizeof(EfaControlMessageHeader)));
+        if (n != sizeof(EfaControlMessageHeader))
+        {
+            throw std::runtime_error{"Failed to read response header"};
+        }
+        sb.commit(n);
+
+        EfaControlMessageHeader header;
+        copyFromStreambuf(sb, /*inout*/header);
+
+        if (header._protocolVersion != PROTOCOL_VERSION)
+        {
+            throw std::runtime_error{"Invalid protocol version"};
+        }
+        if (header._type != EfaControlMessageType::SERVER_REJECT_V1 &&
+            header._type != EfaControlMessageType::SERVER_ACCEPT_V1)
+        {
+            throw std::runtime_error{
+                "Invalid control message type, expected SERVER_REJECT or SERVER_ACCEPT"};
+        }
+
+        if (header._type == EfaControlMessageType::SERVER_REJECT_V1)
+        {
+            assert( header._length == sizeof(EfaServerRejectV1) );
+            EfaServerRejectV1 rejectMessage;
+            n = asio::read(socket, sb.prepare(sizeof(EfaServerRejectV1)));
+            if (n != sizeof(EfaServerRejectV1))
+            {
+                throw std::runtime_error{"Failed to read EfaServerRejectV1 payload"};
+            }
+            sb.commit(n);
+
+            copyFromStreambuf(sb, /*inout*/rejectMessage);
+            throw std::runtime_error{"Connection rejected: " + std::string(rejectMessage._errorMessage)};
+        }
+        else if (header._type == EfaControlMessageType::SERVER_ACCEPT_V1)
+        {
+            assert( header._length == sizeof(EfaServerAcceptV1) );
+            EfaServerAcceptV1 acceptMessage;
+            n = asio::read(socket, sb.prepare(sizeof(EfaServerAcceptV1)));
+            if (n != sizeof(EfaServerAcceptV1))
+            {
+                throw std::runtime_error{"Failed to read acceptMessage payload"};
+            }
+            sb.commit(n);
+            copyFromStreambuf(sb, /*inout*/acceptMessage);
+
+            DEBUG_LOG("Connection accepted:\n  accept time: %lu\n  frame size: %u\n  metadata size: "
+                      "%u\n  has active producers: %u",
+                      acceptMessage._acceptConnectionTime,
+                      acceptMessage._frameSize,
+                      acceptMessage._frameMetadataSize,
+                      acceptMessage._hasActiveProducers);
+
+            if (acceptMessage._frameSize != _options._frameSize)
+            {
+                EfaClientShutdownV1 shutdownMessage;
+                sendHeader._length = sizeof(shutdownMessage);
+                sendHeader._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
+                sendBufs = {
+                    asio::buffer(&sendHeader, sizeof(sendHeader)),
+                    asio::buffer(&shutdownMessage, sizeof(shutdownMessage))
+                };
+                asio::write(socket, sendBufs);
+                socket.close();
+                throw std::runtime_error{"Invalid frame size"};
+            }
+            DEBUG_LOG("Connection accepted");
+        }
 
         _progressEngine->addEndpoint(_endpoint, this);
         // defer( _progressEngine->removeEndpoint(_endpoint) );
@@ -212,10 +329,14 @@ public:
 
         DEBUG_LOG("Sending shutdown");
 
-        EfaControlMessage<EfaClientShutdownV1> shutdownMessage;
-        shutdownMessage._length = sizeof(shutdownMessage);
-        shutdownMessage._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
-        asio::write(socket, asio::buffer(&shutdownMessage, sizeof(shutdownMessage)));
+        EfaClientShutdownV1 shutdownMessage;
+        sendHeader._length = sizeof(shutdownMessage);
+        sendHeader._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
+        sendBufs = {
+            asio::buffer(&sendHeader, sizeof(sendHeader)),
+            asio::buffer(&shutdownMessage, sizeof(shutdownMessage))
+        };
+        asio::write(socket, sendBufs);
         socket.close();
 
         _progressEngine->removeEndpoint(_endpoint);
@@ -282,6 +403,11 @@ private:
             ++numMessageReceived;
             if (_options._verbose)
                 DEBUG_LOG("Received: %u (%zu bytes id=%u)", numMessageReceived, entry.len, _peerId);
+            if (_options._numMessages > 0 && numMessageReceived >= (unsigned)_options._numMessages)
+            {
+                DEBUG_LOG("Received %u messages, stopping", numMessageReceived);
+                break;
+            }
         }
     }
 
@@ -320,7 +446,7 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:r:s:N:v")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:n:r:f:s:N:v")) != -1)
     {
         switch (opt)
         {
@@ -339,15 +465,15 @@ int main(int argc, char* argv[])
         case 'r':
             options._numReceivers = std::atoi(optarg);
             break;
-        //case 'f':
-        //    options._flowId = optarg;
-        //    break;
+        case 'f':
+           options._flowId = optarg;
+           break;
         case 's':
            options._frameSize = std::atoi(optarg);
            break;
-            case 'N':
-                options._numProgressEngines = std::atoi(optarg);
-            break;
+        case 'N':
+            options._numProgressEngines = std::atoi(optarg);
+        break;
         case 'v':
            options._verbose = true;
            break;
