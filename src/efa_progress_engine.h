@@ -26,19 +26,6 @@ protected:
     ~EfaProgressCallback() = default;
 };
 
-// alternative names: EfaCompletionPoller, a ProgressEngine moze byc czyms wyzej
-// wtedy jaka nazwa na EfaProgress? EfaCompletionSource
-
-// class EfaProgress
-// {
-// public:
-//     virtual ~EfaProgress() = default;
-//     virtual void                         onCompletion(uint64_t flags, size_t length) noexcept = 0;
-//     virtual void                         onError(int errorCode) noexcept                      = 0;
-//     virtual std::shared_ptr<RdmEndpoint> getEndpoint()                                        = 0;
-//     virtual std::shared_ptr<fid_cq>      getCompletionQueue()                                 = 0;
-// };
-
 class EfaProgressEngine final
 {
 public:
@@ -128,7 +115,7 @@ private:
 
     void threadFunc()
     {
-        fi_cq_msg_entry entry[MAX_COMPLETION_ENTRY_PROGRESS];
+        fi_cq_msg_entry entry[MAX_COMPLETION_ENTRY_PROGRESS] = {};
         while (true)
         {
             std::unique_lock lock{_mtx};
@@ -144,7 +131,7 @@ private:
                 {
                     continue;
                 }
-                const int n = fi_cq_read(
+                const ssize_t n = fi_cq_read(
                     ep._endpoint->_completionQueue.get(), &entry, MAX_COMPLETION_ENTRY_PROGRESS);
                 if (n > 0)
                 {
@@ -157,7 +144,7 @@ private:
                 }
                 else if (n != -FI_EAGAIN && n != -FI_EINTR)
                 {
-                    fi_cq_err_entry errEntry;
+                    fi_cq_err_entry errEntry{};
                     const auto      ret =
                         fi_cq_readerr(ep._endpoint->_completionQueue.get(), &errEntry, 0);
                     if (ret < 0)
@@ -184,12 +171,10 @@ private:
             , _callback{callback}
             , _outstandingWork{0}
         {
-            _ccc = uintptr_t(_callback);
         }
 
         std::shared_ptr<RdmEndpoint> _endpoint;
         EfaProgressCallback* _callback;
-        uintptr_t _ccc;
         uint32_t _outstandingWork;
     };
 

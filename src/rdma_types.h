@@ -17,15 +17,16 @@
 #endif
 
 #include <cstdint>
+#include <cstdio>
 #include <string.h>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -268,8 +269,7 @@ inline std::shared_ptr<fi_info> createFabricInfoHintsRdm(const std::string& in_p
     hints->caps = FI_MSG | FI_RECV | FI_SEND | FI_REMOTE_COMM; // | FI_TAGGED
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
     hints->domain_attr->progress = FI_PROGRESS_MANUAL;
-    // Check FI_THREAD_COMPLETION after https://github.com/ofiwg/libfabric/pull/10939 is merged
-    hints->domain_attr->threading = FI_THREAD_SAFE;
+    hints->domain_attr->threading = FI_THREAD_COMPLETION;
     hints->rx_attr->iov_limit = 4;
     hints->tx_attr->iov_limit = 4;
 
@@ -501,7 +501,6 @@ struct RdmEndpoint
     std::unique_ptr<fid_cq>     _completionQueue;
     std::unique_ptr<fid_av>     _addressVector;
     std::unique_ptr<fid_ep>     _endpoint; // must be destroyed before anything that binds to it (so EQ, CQ and CNTR)
-    bool                        _cqHasWaitObject = true;
 
     RdmEndpoint(const RdmaAdapter& in_adapter)
         : RdmEndpoint(in_adapter, *in_adapter._fabricInfo)
@@ -521,7 +520,7 @@ struct RdmEndpoint
         }
         fi_av_attr avAttrs = {};
         avAttrs.type = in_fabricInfo.domain_attr->av_type;
-        //avAttrs.count = 1;
+        avAttrs.count = 1;
         res = fi_av_open(_domain.get(), &avAttrs, makeOutPointer(_addressVector), nullptr);
         if (res != 0)
         {
@@ -533,12 +532,6 @@ struct RdmEndpoint
         cqAttrs.wait_obj = FI_WAIT_NONE;
         cqAttrs.format = FI_CQ_FORMAT_MSG;
         res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
-        if (res == -FI_ENOSYS)
-        {
-            cqAttrs.wait_obj = FI_WAIT_NONE;
-            res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
-            _cqHasWaitObject = false;
-        }
         if (res != 0)
         {
             throw rdma_error{"fi_cq_open", res};
@@ -563,6 +556,91 @@ struct RdmEndpoint
     }
 };
 
+// Definition from libfabric sources: prov/efa/src/rdm/efa_rdm_protocol.h
+struct efa_ep_addr
+{
+    std::uint8_t raw[16];
+    std::uint16_t qpn;
+    std::uint16_t pad;
+    std::uint32_t qkey;
+};
+
+inline bool parseFabricAddress(const std::string& in_address, std::uint32_t in_addrFormat, void* out_addrBuffer, size_t in_addrLength)
+{
+    if (in_addrFormat == FI_SOCKADDR_IN)
+    {
+        if (in_addrLength < sizeof(sockaddr_in))
+        {
+            return false; // Buffer too small
+        }
+        sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(out_addrBuffer);
+        memset(addr, 0, sizeof(sockaddr_in));
+        addr->sin_family = AF_INET;
+        if (inet_pton(AF_INET, in_address.c_str(), &addr->sin_addr) != 1)
+        {
+            return false;
+        }
+        addr->sin_port = htons(0); // Port is not specified
+    }
+    else if (in_addrFormat == FI_SOCKADDR_IN6)
+    {
+        if (in_addrLength < sizeof(sockaddr_in6))
+        {
+            return false; // Buffer too small
+        }
+        sockaddr_in6* addr = reinterpret_cast<sockaddr_in6*>(out_addrBuffer);
+        memset(addr, 0, sizeof(sockaddr_in6));
+        addr->sin6_family = AF_INET6;
+        if (inet_pton(AF_INET6, in_address.c_str(), &addr->sin6_addr) != 1)
+        {
+            return false;
+        }
+        addr->sin6_port = htons(0); // Port is not specified
+    }
+    else if (in_addrFormat == FI_ADDR_EFA)
+    {
+        if ( in_addrLength < sizeof(efa_ep_addr) )
+        {
+            return false; // Not enough space for EFA address
+        }
+        if ( in_address.rfind( "efa://[", 0 ) != 0 )
+        {
+            return false;
+        }
+        const auto endPos = in_address.find( L']', 7 );
+        if ( endPos == std::string::npos )
+        {
+            return false; // Missing closing bracket
+        }
+        efa_ep_addr* efaAddr = reinterpret_cast<efa_ep_addr*>(out_addrBuffer);
+        const auto ipv6Address = in_address.substr(7, endPos - 7);
+        if (!inet_pton( AF_INET6, ipv6Address.c_str(), efaAddr->raw ))
+        {
+            return false; // Invalid IPv6 address
+        }
+#ifndef _WIN32
+        if ( std::sscanf(in_address.substr(endPos + 1).c_str(), ":%hu:%u", &efaAddr->qpn, &efaAddr->qkey) != 2 )
+#else
+        if ( sscanf_s(in_address.substr(endPos + 1).c_str(), ":%hu:%u", &efaAddr->qpn, &efaAddr->qkey) != 2 )
+#endif
+        {
+            return false; // Invalid format for qpn and qkey
+        }
+        return true;
+    }
+    else if (in_addrFormat == FI_ADDR_STR)
+    {
+        strncpy(reinterpret_cast<char*>(out_addrBuffer), in_address.c_str(), in_addrLength - 1);
+        reinterpret_cast<char*>(out_addrBuffer)[in_addrLength - 1] = '\0'; // Ensure null-termination
+    }
+    else
+    {
+        return false; // Unsupported address format
+    }
+
+    return true;
+}
+
 inline std::string getAddressAsString(const void* in_addr, uint32_t in_addrFormat)
 {
     switch (in_addrFormat)
@@ -583,15 +661,6 @@ inline std::string getAddressAsString(const void* in_addr, uint32_t in_addrForma
     }
     case FI_ADDR_EFA:
     {
-        // Definition from libfabric sources: prov/efa/src/rdm/efa_rdm_protocol.h
-        struct efa_ep_addr
-        {
-            std::uint8_t raw[16];
-            std::uint16_t qpn;
-            std::uint16_t pad;
-            std::uint32_t qkey;
-        };
-
         // EFA 'sock' address is an IPv6 (128 bits for address and 16-bits for port) with an additional 32-bit qkey
         // EFA addresses are not supposed to be human-readable but we need to tell return something stringy on /status request
 
@@ -602,7 +671,7 @@ inline std::string getAddressAsString(const void* in_addr, uint32_t in_addrForma
         }
         const efa_ep_addr* efa_addr = reinterpret_cast<const efa_ep_addr*>(in_addr);
         std::stringstream ss;
-        ss << "efa://[" << buf << "]:" << efa_addr->pad << ':' << efa_addr->qkey;
+        ss << "efa://[" << buf << "]:" << efa_addr->qpn << ':' << efa_addr->qkey;
         return ss.str();
     }
     case FI_ADDR_STR: // Address as a null-terminated string

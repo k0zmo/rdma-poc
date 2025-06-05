@@ -70,7 +70,7 @@ struct FrameBufferHeader
 
 enum class EfaControlMessageType : std::uint8_t
 {
-    INVALID,
+    UNKNOWN,
     CLIENT_CONNECT_V1,
     CLIENT_SHUTDOWN_V1,
     SERVER_ACCEPT_V1,
@@ -80,7 +80,7 @@ enum class EfaControlMessageType : std::uint8_t
 struct EfaControlMessageHeader
 {
     std::uint8_t          _protocolVersion = PROTOCOL_VERSION;
-    EfaControlMessageType _type            = EfaControlMessageType::INVALID;
+    EfaControlMessageType _type            = EfaControlMessageType::UNKNOWN;
     std::uint16_t         _length          = 0;
 };
 
@@ -91,7 +91,7 @@ struct EfaClientConnectV1
     std::uint8_t  _sourceAddressBytes[64]  = {};
     std::uint8_t  _destAddressBytes[64]    = {};
     std::uint8_t  _flowIdentifier[16]      = {};
-    bool          _wantsFrameMetadata      = false;
+    bool          _wantsFrameMetadata      = true;
 };
 
 struct EfaClientShutdownV1

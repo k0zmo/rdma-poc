@@ -48,6 +48,7 @@
 
 struct AppOptions
 {
+    std::string _deviceAddress{""};
     std::string _address{""};
     std::uint16_t _port{16002};
     std::string _providerName{""};
@@ -109,27 +110,6 @@ private:
 using SendTimeoutOption = BaseTimeoutOption<SO_SNDTIMEO>;
 using RecvTimeoutOption = BaseTimeoutOption<SO_RCVTIMEO>;
 
-static unsigned PeerId = 0;
-
-template <typename T>
-size_t copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
-{
-    static_assert(std::is_trivially_copy_assignable_v<T>, "");
-    std::memcpy(&in_value, inout_buf.data(), sizeof(T));
-    inout_buf += sizeof(T);
-    return sizeof(T);
-}
-
-template <typename T>
-size_t copyFromStreambuf(asio::streambuf& inout_buf, T& in_value)
-{
-    static_assert(std::is_trivially_copy_assignable_v<T>, "");
-    auto buf = *inout_buf.data().begin();
-    const auto size = copyFromBuffer(buf, /*inout*/in_value);
-    inout_buf.consume(size);
-    return sizeof(T);
-}
-
 class App : public std::enable_shared_from_this<App>, public EfaProgressCallback
 {
     unsigned _peerId;
@@ -139,7 +119,7 @@ public:
           _ctx{ctx},
           _progressEngine{std::move(progressEngine)}
     {
-        _peerId = ++PeerId;
+
     }
 
     void start()
@@ -165,6 +145,20 @@ public:
         {
             throw rdma_error{"fi_getname", res};
         }
+        char sourceAddrBytes[128];
+
+        // Parse device address if provided, if not use the same as our local address (assuming localhost)
+        if ( _options._deviceAddress.empty() )
+        {
+            std::memcpy(sourceAddrBytes, addrBytes, addrLen);
+        }
+        else
+        {
+            if (!parseFabricAddress( _options._deviceAddress, _adapter->_fabricInfo->addr_format, sourceAddrBytes, sizeof(sourceAddrBytes)))
+            {
+                throw rdma_error{"parseFabricAddress", -FI_EINVAL};
+            }
+        }
 
         uint64_t mrKey = 1;
         for (int i = 0; i < 2; ++i)
@@ -186,7 +180,6 @@ public:
             }
         }
 
-        // FIXME: resolver?
         asio::ip::tcp::endpoint senderEp{asio::ip::make_address(_options._address), _options._port};
         asio::ip::tcp::socket socket{_ctx, asio::ip::tcp::v4()};
         socket.set_option(SendTimeoutOption{std::chrono::milliseconds(1000)});
@@ -206,7 +199,7 @@ public:
             throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
         }
         memcpy(&connectMessage._destAddressBytes, addrBytes, addrLen);
-        memcpy(&connectMessage._sourceAddressBytes, addrBytes, addrLen);
+        memcpy(&connectMessage._sourceAddressBytes, sourceAddrBytes, addrLen);
         connectMessage._wantsFrameMetadata = false;
 
         if (!_options._flowId.empty())
@@ -240,53 +233,44 @@ public:
         };
         asio::write(socket, sendBufs);
 
-        asio::streambuf sb;
-        size_t n = asio::read(socket, sb.prepare(sizeof(EfaControlMessageHeader)));
+        EfaControlMessageHeader receiveHeader;
+        size_t n = asio::read(socket, asio::buffer(&receiveHeader, sizeof(receiveHeader)));
         if (n != sizeof(EfaControlMessageHeader))
         {
             throw std::runtime_error{"Failed to read response header"};
         }
-        sb.commit(n);
 
-        EfaControlMessageHeader header;
-        copyFromStreambuf(sb, /*inout*/header);
-
-        if (header._protocolVersion != PROTOCOL_VERSION)
+        if (receiveHeader._protocolVersion != PROTOCOL_VERSION)
         {
             throw std::runtime_error{"Invalid protocol version"};
         }
-        if (header._type != EfaControlMessageType::SERVER_REJECT_V1 &&
-            header._type != EfaControlMessageType::SERVER_ACCEPT_V1)
+        if (receiveHeader._type != EfaControlMessageType::SERVER_REJECT_V1 &&
+            receiveHeader._type != EfaControlMessageType::SERVER_ACCEPT_V1)
         {
             throw std::runtime_error{
                 "Invalid control message type, expected SERVER_REJECT or SERVER_ACCEPT"};
         }
 
-        if (header._type == EfaControlMessageType::SERVER_REJECT_V1)
+        if (receiveHeader._type == EfaControlMessageType::SERVER_REJECT_V1)
         {
-            assert( header._length == sizeof(EfaServerRejectV1) );
+            assert( receiveHeader._length == sizeof(EfaServerRejectV1) );
             EfaServerRejectV1 rejectMessage;
-            n = asio::read(socket, sb.prepare(sizeof(EfaServerRejectV1)));
+            n = asio::read(socket, asio::buffer(&rejectMessage, sizeof(EfaServerRejectV1)));
             if (n != sizeof(EfaServerRejectV1))
             {
                 throw std::runtime_error{"Failed to read EfaServerRejectV1 payload"};
             }
-            sb.commit(n);
-
-            copyFromStreambuf(sb, /*inout*/rejectMessage);
             throw std::runtime_error{"Connection rejected: " + std::string(rejectMessage._errorMessage)};
         }
-        else if (header._type == EfaControlMessageType::SERVER_ACCEPT_V1)
+        else if (receiveHeader._type == EfaControlMessageType::SERVER_ACCEPT_V1)
         {
-            assert( header._length == sizeof(EfaServerAcceptV1) );
+            assert( receiveHeader._length == sizeof(EfaServerAcceptV1) );
             EfaServerAcceptV1 acceptMessage;
-            n = asio::read(socket, sb.prepare(sizeof(EfaServerAcceptV1)));
+            n = asio::read(socket, asio::buffer(&acceptMessage, sizeof(EfaServerAcceptV1)));
             if (n != sizeof(EfaServerAcceptV1))
             {
                 throw std::runtime_error{"Failed to read acceptMessage payload"};
             }
-            sb.commit(n);
-            copyFromStreambuf(sb, /*inout*/acceptMessage);
 
             DEBUG_LOG("Connection accepted:\n  accept time: %lu\n  frame size: %u\n  metadata size: "
                       "%u\n  has active producers: %u",
@@ -312,8 +296,6 @@ public:
         }
 
         _progressEngine->addEndpoint(_endpoint, this);
-        // defer( _progressEngine->removeEndpoint(_endpoint) );
-
         _progressEngine->postWork(_endpoint, 2);
 
         try
@@ -446,10 +428,13 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:n:r:f:s:N:v")) != -1)
+    while ((opt = getopt(argc, argv, "d:a:B:p:n:r:f:s:N:v")) != -1)
     {
         switch (opt)
         {
+        case 'd':
+            options._deviceAddress = optarg;
+            break;
         case 'a':
             options._address = optarg;
             break;
