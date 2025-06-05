@@ -64,8 +64,9 @@ USER $USERNAME
 WORKDIR /home/$USERNAME
 
 # Libfabric
-ARG LIBFABRC_VERSION=2.1.0
-RUN wget -O - https://github.com/ofiwg/libfabric/archive/v${LIBFABRC_VERSION}.tar.gz | tar -zxf - \
+# 2.1.x branch
+ARG LIBFABRC_VERSION=71f7f3a170c69422308a84306df4af952e11a8ad
+RUN wget -O - https://github.com/ofiwg/libfabric/archive/${LIBFABRC_VERSION}.tar.gz | tar -zxf - \
  && cd libfabric-${LIBFABRC_VERSION} \
  && ./autogen.sh \
  && ./configure --enable-debug --enable-verbs=dl --enable-efa=dl --enable-sockets=no --enable-usnic=no --enable-shared --disable-static --prefix=/opt/libfabric \
