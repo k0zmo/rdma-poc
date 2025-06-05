@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include <ctime>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <stdlib.h>
 #include <string>
 #include <system_error>
@@ -503,13 +505,16 @@ int main(int argc, char* argv[])
                 b->app->stop();
         });
 
+        std::vector<int> finished(options._numReceivers, 0);
+        std::mutex finishedMutex;
+
         for (int i = 0, p = 0; i < options._numReceivers; ++i)
         {
             auto bundle = std::make_unique<Bundle>();
             DEBUG_LOG("CREATING APP [%d] with PROGRESS [%d]", i, p);
             bundle->app = std::make_unique<App>(options, ctx, progressEngines[p]);
             p = (p + 1) % options._numProgressEngines;
-            bundle->thread = std::thread{[self = bundle->app.get(), i]() mutable {
+            bundle->thread = std::thread{[self = bundle->app.get(), i, &finishedMutex, &finished, &ctx]() mutable {
                 try
                 {
                     self->start();
@@ -517,6 +522,16 @@ int main(int argc, char* argv[])
                 catch (const std::exception& ex)
                 {
                     DEBUG_LOG("EXCEPTION on receiver[%d]: %s", i, ex.what());
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock{finishedMutex};
+                    finished[i] = 1;
+                    if (std::all_of(finished.begin(), finished.end(), [](int f) { return f == 1; }))
+                    {
+                        DEBUG_LOG("All receivers finished, stopping context");
+                        ctx.stop();
+                    }
                 }
             }};
             bundles.push_back(std::move(bundle));
