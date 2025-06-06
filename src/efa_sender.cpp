@@ -441,8 +441,11 @@ private:
                 DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, cqe.flags, cqe.length);
             }
     
-            std::this_thread::sleep_until(nextTimePoint);
-            nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
+            if (_options._intervalMs > 0)
+            {
+                std::this_thread::sleep_until(nextTimePoint);
+                nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
+            }
         }
 
         _progress->removeEndpoint(_endpoint);
