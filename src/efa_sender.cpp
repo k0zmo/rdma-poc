@@ -1,7 +1,6 @@
 #include "rdma_types.h"
 #include "rdma_defs.h"
 #include "getopt.h"
-#include "efa_progress_engine.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -56,7 +55,7 @@ struct AppOptions
     std::string _providerName{""};
 //    std::string _flowId{};
     std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
-    int _numProgressEngines{1};
+    int _numDomains{1};
     int _intervalMs{20}; // 50p
     bool _verbose{false};
 };
@@ -101,22 +100,20 @@ asio::const_buffers_1 getAsBuffer( const std::vector<uint8_t>& in_buf )
     return asio::buffer( in_buf.data(), in_buf.size() );
 }
 
-class Peer : public std::enable_shared_from_this<Peer>, public EfaProgressCallback
+class Peer : public std::enable_shared_from_this<Peer>
 {
     /// This is the maximum size of the message buffer that we will use to read messages from the socket.
     static constexpr size_t MAX_MESSAGE_BUFFER_SIZE = 64 * 1024;
 
 public:
-    Peer(asio::io_context&                  ctx,
-         asio::ip::tcp::socket              socket,
-         std::shared_ptr<fi_info>           fabricInfo,
-         std::shared_ptr<EfaProgressEngine> progress,
-         AppOptions                         options) :
+    Peer(asio::io_context&          ctx,
+         asio::ip::tcp::socket      socket,
+         std::shared_ptr<EfaDomain> domain,
+         AppOptions                 options) :
         _ctx{ctx},
         _socket{std::move(socket)},
         _options{std::move(options)},
-        _adapter{std::make_shared<RdmaAdapter>(std::move(fabricInfo))},
-        _progress{std::move(progress)}
+        _domain{std::move(domain)}
     {
     }
 
@@ -216,10 +213,10 @@ private:
         const auto consumed = copyFromBuffer(payloadBuf, /*inout*/clientConnect);
         _dynamicBuf.consume(consumed);
 
-        if (clientConnect._addressFormat != _adapter->_fabricInfo->addr_format)
+        if (clientConnect._addressFormat != _domain->_fabric->_fabricInfo->addr_format)
         {
             std::stringstream ss;
-            ss << "Invalid address format, must be " << (uint32_t)_adapter->_fabricInfo->addr_format;
+            ss << "Invalid address format, must be " << (uint32_t)_domain->_fabric->_fabricInfo->addr_format;
             rejectConnection(ss.str());
             return false;
         }
@@ -236,7 +233,7 @@ private:
         _sendingThread = std::thread{[self = shared_from_this(), clientConnect]() mutable {
             try
             {
-                self->createRdmEndpoint(clientConnect);
+                self->createEfaEndpoint(clientConnect);
                 self->createData();
                 self->sendLoop();
 
@@ -335,9 +332,10 @@ private:
                          });
     }
 
-    void createRdmEndpoint(const EfaClientConnectV1& clientConnect)
+    void createEfaEndpoint(const EfaClientConnectV1& clientConnect)
     {
-        _endpoint = std::make_shared<RdmEndpoint>(*_adapter);
+        _endpoint = std::make_shared<EfaEndpoint>(_domain);
+        _progressable = std::make_shared<Progressable>(*_endpoint->_completionQueue, _completionQueue);
 
         auto res = fi_av_insert(_endpoint->_addressVector.get(), clientConnect._destAddressBytes, 1, &_addrVector, 0U, nullptr);
         if (res != 1) // Returns number of addresses inserted
@@ -361,22 +359,12 @@ private:
     void createData()
     {
         _message = std::make_unique<char[]>(_options._frameSize);
-        const auto res = fi_mr_reg(_adapter->_domain.get(), _message.get(), _options._frameSize, FI_SEND, 0, _key++, 0,
-                                   makeOutPointer(_memoryRegion), (EfaProgressCallback*)this);
+        const auto res = fi_mr_reg(_domain->_domain.get(), _message.get(), _options._frameSize, FI_SEND, 0, _key++, 0,
+                                   makeOutPointer(_memoryRegion), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_mr_reg", res};
         }
-    }
-
-    void onCompletion(uint64_t flags, size_t length) noexcept override
-    {
-        _completionQueue.enqueue({0, flags, length});
-    }
-
-    void onError(int errorCode) noexcept override
-    {
-        _completionQueue.enqueue({errorCode, 0, 0});
     }
 
     void sendLoop()
@@ -385,16 +373,16 @@ private:
         auto nextTimePoint = steady_clock::now() + milliseconds{_options._intervalMs};
         unsigned numMessageSent = 0;
 
-        _progress->addEndpoint(_endpoint, this);
         unsigned attempts = 0;
+        _domain->_executionCtx->addProgressable(_progressable);
 
         while (!_stopped)
         {
             ssize_t result = fi_send(_endpoint->_endpoint.get(), _message.get(), _options._frameSize,
-                                     fi_mr_desc(_memoryRegion.get()), _addrVector, (EfaProgressCallback*)this);
+                                     fi_mr_desc(_memoryRegion.get()), _addrVector, nullptr);
             if (result == 0)
             {
-                _progress->postWork(_endpoint, 1);
+                _domain->_executionCtx->postWork(_progressable, 1);
                 attempts = 0;
             }
             else
@@ -448,7 +436,7 @@ private:
             }
         }
 
-        _progress->removeEndpoint(_endpoint);
+        _domain->_executionCtx->removeProgressable(_progressable);
     }
 
 private:
@@ -458,7 +446,7 @@ private:
 
     asio::streambuf _dynamicBuf;
 
-    std::shared_ptr<RdmaAdapter> _adapter;
+    std::shared_ptr<EfaDomain> _domain;
 
     fi_addr_t _addrVector;
 
@@ -470,10 +458,37 @@ private:
     };
     moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
+    struct Progressable : EfaProgressable
+    {
+        Progressable(fid_cq& in_cq, moodycamel::BlockingConcurrentQueue<CompletionEntry>& in_queue)
+            : _completionQueue(in_cq),
+              _completionEntryQueue(in_queue)
+        {
+        }
+
+        fid_cq& _completionQueue;
+        moodycamel::BlockingConcurrentQueue<CompletionEntry>& _completionEntryQueue;
+
+        void onCompletion(uint64_t flags, size_t length) noexcept override
+        {
+            _completionEntryQueue.enqueue(CompletionEntry{0, flags, length});
+        }
+
+        void onError(int errorCode) noexcept override
+        {
+            _completionEntryQueue.enqueue(CompletionEntry{errorCode, 0, 0});
+        }
+
+        fid_cq& getCompletionQueue() const override
+        {
+            return _completionQueue;
+        }
+    };
+
     std::unique_ptr<char[]> _message;
     std::unique_ptr<fid_mr> _memoryRegion;
-    std::shared_ptr<EfaProgressEngine> _progress;
-    std::shared_ptr<RdmEndpoint> _endpoint;
+    std::shared_ptr<EfaEndpoint> _endpoint;
+    std::shared_ptr<Progressable> _progressable;
     std::thread _sendingThread;
 
     bool _accepted = false;
@@ -497,18 +512,20 @@ public:
     {
         // TODO: go through all fi_info (->next) and create EfaAdapter from all of them
         std::shared_ptr<fi_info> hints = createFabricInfoHintsRdm("");
-        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(_fabricInfo));
-        if (res != 0 || !_fabricInfo)
+        std::shared_ptr<fi_info> fabricInfo;
+        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(fabricInfo));
+        if (res != 0 || !fabricInfo)
         {
             throw rdma_error{"fi_getinfo", res};
         }
-        DEBUG_LOG("Provider: %s", _fabricInfo->fabric_attr->prov_name);
-        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*_fabricInfo).c_str());
+        DEBUG_LOG("Provider: %s", fabricInfo->fabric_attr->prov_name);
+        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*fabricInfo).c_str());
 
-        _progressEngines.reserve(_options._numProgressEngines);
-        for (int i = 0; i < _options._numProgressEngines; ++i)
+        _fabric = std::make_shared<EfaFabric>(std::move(fabricInfo));
+        _domains.reserve(_options._numDomains);
+        for (int i = 0; i < _options._numDomains; ++i)
         {
-            _progressEngines.push_back(std::make_shared<EfaProgressEngine>());
+            _domains.push_back(std::make_shared<EfaDomain>(_fabric));
         }
 
         _acceptor.open(asio::ip::tcp::v4());
@@ -542,12 +559,9 @@ private:
 
             if (!ec)
             {
-                auto peer              = std::make_shared<Peer>(_ctx,
-                                                   std::move(socket),
-                                                   _fabricInfo,
-                                                   _progressEngines[_currentProgressEngine],
-                                                   _options);
-                _currentProgressEngine = (_currentProgressEngine + 1) % _options._numProgressEngines;
+                auto peer = std::make_shared<Peer>(
+                    _ctx, std::move(socket), _domains[_currentDomain], _options);
+                _currentDomain = (_currentDomain + 1) % _options._numDomains;
                 _peers.push_back(peer);
                 peer->start();
             }
@@ -561,9 +575,9 @@ private:
     asio::io_context& _ctx;
     asio::ip::tcp::acceptor _acceptor;
     std::vector<std::weak_ptr<Peer>> _peers;
-    std::shared_ptr<fi_info> _fabricInfo;
-    std::vector<std::shared_ptr<EfaProgressEngine>> _progressEngines;
-    int _currentProgressEngine = 0;
+    std::shared_ptr<EfaFabric> _fabric;
+    std::vector<std::shared_ptr<EfaDomain>> _domains;
+    int _currentDomain = 0;
     bool _stopped = false;
 };
 
@@ -575,39 +589,18 @@ int main(int argc, char* argv[])
     AppOptions options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:f:vs:N:t:")) != -1)
+    while ((opt = getopt(argc, argv, "B:p:vs:N:t:")) != -1)
     {
         switch (opt)
         {
-        ///case 'a':
-        ///    options._address = optarg;
-        ///    break;
-        case 'B':
-            options._port = (uint16_t)std::atoi(optarg);
-            break;
-        case 'p':
-            options._providerName = optarg;
-            break;
-        //case 'f':
-        //    options._flowId = optarg;
-        //    break;
-        case 'v':
-           options._verbose = true;
-           break;
-        case 's':
-            options._frameSize = (unsigned)std::atoi(optarg);
-            break;
-        case 't':
-            options._intervalMs = std::atoi(optarg);
-            break;
-        case 'N':
-            options._numProgressEngines = std::atoi(optarg);
-           break;
-        case '?':
-            std::fprintf(stderr, "Unknown option: %c\n", opt);
-            return 1;
-        default:
-            return 1;
+        case 'B': options._port = (uint16_t)std::atoi(optarg); break;
+        case 'p': options._providerName = optarg; break;
+        case 'v': options._verbose = true; break;
+        case 's': options._frameSize = (unsigned)std::atoi(optarg); break;
+        case 't': options._intervalMs = std::atoi(optarg); break;
+        case 'N': options._numDomains = std::atoi(optarg); break;
+        case '?': std::fprintf(stderr, "Unknown option: %c\n", opt); return 1;
+        default:  return 1;
         }
     }
 

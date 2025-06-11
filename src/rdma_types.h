@@ -16,19 +16,24 @@
 #include <ws2tcpip.h>
 #endif
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <string.h>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #define DEBUG_LOG(...)                                                                                                 \
     do                                                                                                                 \
@@ -494,45 +499,273 @@ struct RdmaListeningEndpoint
     }
 };
 
-struct RdmEndpoint
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct EfaFabric
 {
-    std::shared_ptr<fid_domain> _domain;
+    std::shared_ptr<fi_info>    _fabricInfo;
     std::shared_ptr<fid_fabric> _fabric;
 
-    std::unique_ptr<fid_cq>     _completionQueue;
-    std::unique_ptr<fid_av>     _addressVector;
-    std::unique_ptr<fid_ep>     _endpoint; // must be destroyed before anything that binds to it (so EQ, CQ and CNTR)
+    explicit EfaFabric(std::shared_ptr<fi_info> in_fabricInfo)
+        : _fabricInfo{std::move(in_fabricInfo)}
+    {
+        int res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_fabric", res};
+        }
 
-    RdmEndpoint(const RdmaAdapter& in_adapter)
-        : RdmEndpoint(in_adapter, *in_adapter._fabricInfo)
+
+    }
+};
+
+class EfaCompletionCallback
+{
+public:
+    virtual void onCompletion(uint64_t flags, size_t length) noexcept = 0;
+
+protected:
+    ~EfaCompletionCallback() {}
+};
+
+class EfaProgressable : public EfaCompletionCallback
+{
+public:
+    virtual ~EfaProgressable() {}
+    virtual void onError(int errorCode) noexcept = 0;
+    virtual fid_cq& getCompletionQueue() const = 0;
+};
+
+class EfaExecutionContext final
+{
+public:
+    static constexpr uint32_t MAX_COMPLETION_ENTRY_PROGRESS = 4;
+
+    EfaExecutionContext() :
+        _stopped{false},
+        _workThread{&EfaExecutionContext::threadFunc, this}
     {
     }
 
-    RdmEndpoint(const RdmaAdapter& in_adapter, const fi_info& in_fabricInfo)
-        : _domain{in_adapter._domain}
-        , _fabric{in_adapter._fabric}
-    {
-        assert(in_fabricInfo.ep_attr->type == FI_EP_RDM);
+    EfaExecutionContext(const EfaExecutionContext&)            = delete;
+    EfaExecutionContext& operator=(const EfaExecutionContext&) = delete;
 
-        int res = fi_endpoint(_domain.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_endpoint), nullptr);
+    ~EfaExecutionContext()
+    {
+        {
+            std::lock_guard lock{_mtx};
+            _stopped = true;
+        }
+        _condVar.notify_one();
+
+        if (_workThread.joinable())
+        {
+            _workThread.join();
+        }
+    }
+
+    void postWork(const std::shared_ptr<EfaProgressable>& progressable, uint32_t count = 1)
+    {
+        const bool needNotification = [&] {
+            std::lock_guard lock{_mtx};
+            const auto      it = findProgressableContext(progressable);
+            if (it == _progressables.end())
+            {
+                return false;
+            }
+            const auto prevOutstandingWork = it->_pendingOps;
+            it->_pendingOps += count;
+            return prevOutstandingWork == 0;
+        }();
+
+        if (needNotification)
+        {
+            _condVar.notify_one();
+        }
+    }
+
+    void addProgressable(std::shared_ptr<EfaProgressable> progressable)
+    {
+        std::lock_guard lock{_mtx};
+        const auto it = findProgressableContext(progressable);
+        if (it != _progressables.end())
+        {
+            // Already added
+            return;
+        }
+        _progressables.emplace_back(std::move(progressable));
+    }
+
+    void removeProgressable(const std::shared_ptr<EfaProgressable>& progressable)
+    {
+        std::lock_guard lock{_mtx};
+        const auto it = findProgressableContext(progressable);
+        if (it != _progressables.end())
+        {
+            _progressables.erase(it);
+        }
+    }
+
+    size_t getNumProgressables() const
+    {
+        std::lock_guard lock{_mtx};
+        return _progressables.size();
+    }
+
+private:
+    uint32_t getNumPendingOps() const
+    {
+        uint32_t total = 0;
+        for (const auto& ep : _progressables)
+        {
+            total += ep._pendingOps;
+        }
+        return total;
+    }
+
+    void threadFunc()
+    {
+        fi_cq_msg_entry entry[MAX_COMPLETION_ENTRY_PROGRESS] = {};
+        while (true)
+        {
+            std::unique_lock lock{_mtx};
+            _condVar.wait(lock, [this] { return getNumPendingOps() > 0 || _stopped; });
+            if (_stopped)
+            {
+                return;
+            }
+
+            for (auto& progressableCtx : _progressables)
+            {
+                if (progressableCtx._pendingOps == 0)
+                {
+                    continue;
+                }
+                const ssize_t n = fi_cq_read(
+                    &progressableCtx._progressable->getCompletionQueue(), &entry, MAX_COMPLETION_ENTRY_PROGRESS);
+                if (n > 0)
+                {
+                    progressableCtx._pendingOps -= n;
+
+                    for (int i = 0; i < n; ++i)
+                    {
+                        if (!entry[i].op_context)
+                        {
+                            // Use a default completion callback
+                            progressableCtx._progressable->onCompletion(entry[i].flags, entry[i].len);
+                        }
+                        else
+                        {
+                            // If the op_context is set, it means that the operation was posted
+                            // with a custom context, so we can use it to identify the operation.
+                            // Otherwise, we just call onCompletion with flags and length.
+                            auto* ctx = static_cast<EfaCompletionCallback*>(entry[i].op_context);
+                            ctx->onCompletion(entry[i].flags, entry[i].len);
+                        }
+                    }
+                }
+                else if (n != -FI_EAGAIN && n != -FI_EINTR)
+                {
+                    fi_cq_err_entry errEntry{};
+                    const auto      ret = fi_cq_readerr(
+                        &progressableCtx._progressable->getCompletionQueue(), &errEntry, 0);
+                    if (ret < 0)
+                    {
+                        // Could happen if there's another progress engine, polling the same CQ
+                        // We don't do it but let's ignore that warning for now.
+                        // Going through the libfabric code, it's the only error that may be
+                        // returned from fi_cq_readerr
+                        assert(ret == -FI_EAGAIN);
+                    }
+
+                    progressableCtx._pendingOps -= 1;
+                    progressableCtx._progressable->onError(errEntry.err);
+                }
+            }
+        }
+    }
+
+private:
+    struct ProgressableContext
+    {
+        ProgressableContext(std::shared_ptr<EfaProgressable> progressable)
+            : _progressable{std::move(progressable)}
+            , _pendingOps{0}
+        {
+        }
+
+        std::shared_ptr<EfaProgressable> _progressable;
+        uint32_t _pendingOps;
+    };
+
+    std::vector<ProgressableContext>::iterator
+    findProgressableContext(const std::shared_ptr<EfaProgressable>& progressable)
+    {
+        return std::find_if(_progressables.begin(), _progressables.end(), [&](const ProgressableContext& ep) {
+            return ep._progressable == progressable;
+        });
+    }
+
+    mutable std::mutex _mtx;
+    std::condition_variable _condVar;
+    std::vector<ProgressableContext> _progressables;
+
+    bool _stopped;
+    std::thread _workThread;
+};
+
+struct EfaDomain
+{
+    std::shared_ptr<EfaFabric> _fabric;
+    std::unique_ptr<fid_domain> _domain;
+    std::unique_ptr<EfaExecutionContext> _executionCtx;
+
+    explicit EfaDomain(std::shared_ptr<EfaFabric> in_fabric)
+        : _fabric{std::move(in_fabric)}
+    {
+        int res = fi_domain(_fabric->_fabric.get(), _fabric->_fabricInfo.get(), makeOutPointer(_domain), nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_domain", res};
+        }
+
+        _executionCtx = std::make_unique<EfaExecutionContext>();
+    }
+};
+
+struct EfaEndpoint
+{
+    std::shared_ptr<EfaDomain> _domain;
+
+    std::unique_ptr<fid_cq>    _completionQueue;
+    std::unique_ptr<fid_av>    _addressVector;
+    std::unique_ptr<fid_ep>    _endpoint; // must be destroyed before anything that binds to it (so EQ, CQ and CNTR)
+
+    EfaEndpoint(std::shared_ptr<EfaDomain> in_domain)
+        : _domain{std::move(in_domain)}
+    {
+        assert(_domain->_fabric->_fabricInfo->ep_attr->type == FI_EP_RDM);
+
+        int res = fi_endpoint(_domain->_domain.get(), _domain->_fabric->_fabricInfo.get(), makeOutPointer(_endpoint), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_endpoint", res};
         }
+
         fi_av_attr avAttrs = {};
-        avAttrs.type = in_fabricInfo.domain_attr->av_type;
+        avAttrs.type = _domain->_fabric->_fabricInfo->domain_attr->av_type;
         avAttrs.count = 1;
-        res = fi_av_open(_domain.get(), &avAttrs, makeOutPointer(_addressVector), nullptr);
+        res = fi_av_open(_domain->_domain.get(), &avAttrs, makeOutPointer(_addressVector), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_av_open", res};
         }
 
         fi_cq_attr cqAttrs = {};
-        cqAttrs.size = in_fabricInfo.tx_attr->size; // We can limit it later, for now use the full capability
+        cqAttrs.size = _domain->_fabric->_fabricInfo->tx_attr->size; // We can limit it later, for now use the full capability
         cqAttrs.wait_obj = FI_WAIT_NONE;
         cqAttrs.format = FI_CQ_FORMAT_MSG;
-        res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
+        res = fi_cq_open(_domain->_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_cq_open", res};

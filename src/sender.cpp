@@ -424,29 +424,14 @@ int main(int argc, char* argv[])
     {
         switch (opt)
         {
-        case 'a':
-            options._address = optarg;
-            break;
-        case 'B':
-            options._port = optarg;
-            break;
-        case 'p':
-            options._providerName = optarg;
-            break;
-        case 's':
-            options._frameSize = (unsigned)std::atoi(optarg);
-            break;
-        case 't':
-            options._intervalMs = std::atoi(optarg);
-            break;
-        case 'v':
-            options._verbose = true;
-            break;
-        case '?':
-            std::cerr << "Unknown option: " << char(optopt) << std::endl;
-            return 1;
-        default:
-            return 1;
+        case 'a': options._address = optarg; break;
+        case 'B': options._port = optarg; break;
+        case 'p': options._providerName = optarg; break;
+        case 's': options._frameSize = (unsigned)std::atoi(optarg); break;
+        case 't': options._intervalMs = std::atoi(optarg); break;
+        case 'v': options._verbose = true; break;
+        case '?': std::cerr << "Unknown option: " << char(optopt) << std::endl; return 1;
+        default:  return 1;
         }
     }
 
