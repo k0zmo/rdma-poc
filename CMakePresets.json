@@ -2,30 +2,29 @@
     "version": 3,
     "configurePresets": [
         {
-            "name": "base",
+            "name": ":base",
             "hidden": true,
             "binaryDir": "${sourceDir}/build/${presetName}",
             "installDir": "${sourceDir}/install/${presetName}",
             "generator": "Ninja",
             "cacheVariables": {
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "CMAKE_COLOR_DIAGNOSTICS": "ON",
-                "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE": "ON"
+                "CMAKE_COLOR_DIAGNOSTICS": "ON"
             }
         },
         {
-            "name": "windows",
+            "name": ":windows",
             "hidden": true,
-            "inherits": "base",
+            "inherits": [":base"],
             "condition": { "type": "equals", "rhs": "Windows", "lhs": "${hostSystemName}" },
             "cacheVariables": {
                 "libfabric_ROOT": "D:\\Programowanie\\pkgs\\libfabric"
             }
         },
         {
-            "name": "linux",
+            "name": ":linux",
             "hidden": true,
-            "inherits": "base",
+            "inherits": [":base"],
             "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
             "cacheVariables": {
                 "libfabric_ROOT": "/opt/libfabric"
@@ -48,7 +47,7 @@
             }
         },
         {
-            "name": "msvc",
+            "name": ":msvc",
             "hidden": true,
             "cacheVariables": {
                 "CMAKE_CXX_COMPILER": "cl",
@@ -64,7 +63,7 @@
             }
         },
         {
-            "name": "gcc",
+            "name": ":gcc",
             "hidden": true,
             "cacheVariables": {
                 "CMAKE_CXX_FLAGS": "-Wall -Wextra -Wpedantic",
@@ -76,34 +75,22 @@
             }
         },
         {
-            "name": "clang",
-            "hidden": true,
-            "cacheVariables": {
-                "CMAKE_CXX_COMPILER": "clang++",
-                "CMAKE_CXX_FLAGS": "-Wall -Wextra -Wpedantic -Wno-missing-braces",
-                "CMAKE_CXX_FLAGS_DEBUG"  : "-O0 -g",
-                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
-                "CMAKE_EXE_LINKER_FLAGS"   : "-Wl,--exclude-libs=ALL -Wl,-z,defs -Wl,--as-needed",
-                "CMAKE_MODULE_LINKER_FLAGS": "-Wl,--exclude-libs=ALL -Wl,-z,defs -Wl,--as-needed",
-                "CMAKE_SHARED_LINKER_FLAGS": "-Wl,--exclude-libs=ALL -Wl,-z,defs -Wl,--as-needed"
-            }
-        },
-        {
-            "name": "debug",
+            "name": ":debug",
             "hidden": true,
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug"
             }
         },
         {
-            "name": "release",
+            "name": ":release",
             "hidden": true,
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release"
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
             }
         },
         {
-            "name": "asan",
+            "name": ":asan",
             "hidden": true,
             "cacheVariables": {
                 "CMAKE_CXX_FLAGS_ASAN": "-O1 -g -fsanitize=address -fno-omit-frame-pointer -DNDEBUG",
@@ -111,53 +98,30 @@
             }
         },
         {
-            "name": "Linux-GCC-Debug",
-            "inherits": ["linux", "gcc", "debug"]
+            "name": ":x64-arch-external",
+            "hidden": true,
+            "architecture": { "strategy": "external", "value": "x64" },
+            "toolset":      { "strategy": "external", "value": "host=x64" }
         },
         {
-            "name": "Linux-GCC-Release",
-            "inherits": ["linux", "gcc", "release"]
+            "name": "gcc-debug",
+            "inherits": [":linux", ":gcc", ":debug"]
         },
         {
-            "name": "Linux-GCC-ASan",
-            "inherits": ["linux", "gcc", "asan"]
+            "name": "gcc-release",
+            "inherits": [":linux", ":gcc", ":release"]
         },
         {
-            "name": "Linux-Clang-Debug",
-            "inherits": ["linux", "clang", "debug"]
+            "name": "gcc-asan",
+            "inherits": [":linux", ":gcc", ":asan"]
         },
         {
-            "name": "Linux-Clang-Release",
-            "inherits": ["linux", "clang", "release"]
+            "name": "msvc-debug",
+            "inherits": [":windows", ":msvc", ":x64-arch-external", ":debug"]
         },
         {
-            "name": "x64-Debug",
-            "inherits": ["windows", "msvc", "debug"],
-            "architecture": {
-                "value": "x64",
-                "strategy": "external"
-            },
-            "toolset": {
-                "value": "host=x64",
-                "strategy": "external"
-            }
-        },
-        {
-            "name": "x64-Release",
-            "inherits": ["release", "x64-Debug"]
-        },
-        {
-            "name": "x64-VS2022",
-            "inherits": ["windows", "msvc"],
-            "generator": "Visual Studio 17 2022",
-            "architecture": {
-                "value": "x64",
-                "strategy": "set"
-            },
-            "toolset": {
-                "value": "host=x64",
-                "strategy": "set"
-            }
+            "name": "msvc-release",
+            "inherits": [":windows", ":msvc", ":x64-arch-external", ":release"]
         }
     ]
 }
