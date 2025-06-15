@@ -1,6 +1,6 @@
+#include "getopt.h"
 #include "rdma_defs.h"
 #include "rdma_types.h"
-#include "getopt.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -16,8 +16,8 @@
 #ifndef _WIN32
 #  include <arpa/inet.h>
 #  include <netdb.h>
-#  include <netinet/ip.h>
 #  include <netinet/in.h>
+#  include <netinet/ip.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #else
@@ -37,17 +37,17 @@
 #include <thread>
 #include <utility>
 
-struct AppOptions
+struct app_options
 {
-    std::string _address{"0.0.0.0"};
-    std::string _port{"8001"};
-    std::string _providerName{"verbs"};
-    std::uint32_t _frameSize{5 * 1024 * 1024}; // 5MB
-    int _intervalMs{20};
-    bool _verbose{false};
+    std::string   address{};
+    std::string   port{"8001"};
+    std::string   provider_name{"verbs"};
+    std::uint32_t frame_size{5 * 1024 * 1024}; // 5MB
+    int           interval_ms{20};
+    bool          verbose{false};
 };
 
-enum class WaitResult
+enum class wait_result
 {
     SENT_MESSAGE,
     GOT_ERROR,
@@ -55,34 +55,41 @@ enum class WaitResult
     TIMEOUT
 };
 
-void handleConnection(RdmaEndpoint& in_endpoint, const AppOptions& in_cfg)
+void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
 {
-    static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT = std::chrono::seconds{2};
-    static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT = std::chrono::seconds{2};
-    static constexpr std::chrono::milliseconds SEND_TIMEOUT = std::chrono::seconds{2};
-    static constexpr std::uint64_t SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
-    static constexpr std::uint64_t RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
+    static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT        = std::chrono::seconds{2};
+    static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT  = std::chrono::seconds{2};
+    static constexpr std::chrono::milliseconds SEND_TIMEOUT          = std::chrono::seconds{2};
+    static constexpr std::uint64_t             SEND_COMPLETION_FLAGS = FI_SEND | FI_MSG;
+    static constexpr std::uint64_t             RECV_COMPLETION_FLAGS = FI_RECV | FI_MSG;
 
-    const auto messageSize = sizeof(FrameInformation) + in_cfg._frameSize + sizeof(FrameBufferHeader);
+    const auto message_size = sizeof(frame_information) + cfg.frame_size + sizeof(frame_buffer_header);
 
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(messageSize);
-    std::memset(buf.get(), 0, messageSize);
-    std::unique_ptr<fid_mr> memoryRegion;
-    int res = fi_mr_reg(in_endpoint._domain.get(), buf.get(), messageSize, FI_SEND, 0, 0, 0,
-                        makeOutPointer(memoryRegion), nullptr);
+    std::unique_ptr<char[]> buf = std::make_unique<char[]>(message_size);
+    std::memset(buf.get(), 0, message_size);
+    std::unique_ptr<fid_mr> memory_region;
+    int res = fi_mr_reg(endpoint.domain_.get(),
+                        buf.get(),
+                        message_size,
+                        FI_SEND,
+                        0,
+                        0,
+                        0,
+                        make_out_pointer(memory_region),
+                        nullptr);
     if (res != 0)
     {
         throw rdma_error{"fi_mr_reg", res};
     }
 
-    in_endpoint.receiveEmptyMessage();
+    endpoint.receive_empty_message();
 
-    ServerConnectionFlowV1B serverData{};
-    serverData._frameSize = in_cfg._frameSize;
-    serverData._acceptConnectionTime = 1111111;
-    serverData._hasActiveProducers = true;
-    serverData._frameMetadataSize = 0;
-    res = fi_accept(in_endpoint._endpoint.get(), &serverData, sizeof(serverData));
+    server_connection_flow_v1b server_data{};
+    server_data.frame_size             = cfg.frame_size;
+    server_data.accept_connection_time = 1111111;
+    server_data.has_active_producers   = true;
+    server_data.frame_metadata_size    = 0;
+    res = fi_accept(endpoint.endpoint_.get(), &server_data, sizeof(server_data));
     if (res != 0)
     {
         throw rdma_error{"fi_accept", res};
@@ -90,13 +97,17 @@ void handleConnection(RdmaEndpoint& in_endpoint, const AppOptions& in_cfg)
 
     std::cout << "Waiting on connected event";
 
-    uint32_t event;
-    const auto cmEntrySize = in_endpoint.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
-    std::unique_ptr<uint8_t[]> cmEntryBuffer = std::make_unique<uint8_t[]>(cmEntrySize);
-    fi_eq_cm_entry* cmEntry = reinterpret_cast<fi_eq_cm_entry*>(cmEntryBuffer.get());
+    uint32_t   event;
+    const auto cm_entry_size = endpoint.max_connection_data_size() + sizeof(fi_eq_cm_entry);
+    std::unique_ptr<uint8_t[]> cm_entry_buffer = std::make_unique<uint8_t[]>(cm_entry_size);
+    fi_eq_cm_entry*            cm_entry = reinterpret_cast<fi_eq_cm_entry*>(cm_entry_buffer.get());
 
-    ssize_t ret = fi_eq_sread(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize,
-                              static_cast<int>(ACCEPT_TIMEOUT.count()), 0U);
+    ssize_t ret = fi_eq_sread(endpoint.event_queue_.get(),
+                              &event,
+                              cm_entry,
+                              cm_entry_size,
+                              static_cast<int>(ACCEPT_TIMEOUT.count()),
+                              0U);
     if (ret <= 0 || event != FI_CONNECTED)
     {
         std::cout << " - Failed to connect!\n";
@@ -106,155 +117,174 @@ void handleConnection(RdmaEndpoint& in_endpoint, const AppOptions& in_cfg)
 
     // Wait for first signal-ready message
     fi_cq_msg_entry entry;
-    ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1,
-                      nullptr, static_cast<int>(INITIAL_RECV_TIMEOUT.count()));
+    ret = fi_cq_sread(endpoint.completion_queue_.get(),
+                      &entry,
+                      1,
+                      nullptr,
+                      static_cast<int>(INITIAL_RECV_TIMEOUT.count()));
     if (ret <= 0 || (entry.flags & RECV_COMPLETION_FLAGS) != RECV_COMPLETION_FLAGS)
     {
         std::cout << "Didn't receive first signal-ready message\n";
         return;
     }
 
-    int numMessageSent = 0;
-    uintptr_t clientId = reinterpret_cast<uintptr_t>(&in_endpoint);
+    int       num_message_sent = 0;
+    uintptr_t client_id        = reinterpret_cast<uintptr_t>(&endpoint);
 
-    FrameInformation* fi = reinterpret_cast<FrameInformation*>(buf.get());
-    fi->_frameIndex = 10000 + numMessageSent;
-    fi->_bufferUsageCount = numMessageSent + 1;
-    fi->_flags = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
+    frame_information* fi  = reinterpret_cast<frame_information*>(buf.get());
+    fi->frame_index        = 10000 + num_message_sent;
+    fi->buffer_usage_count = num_message_sent + 1;
+    fi->flags              = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
 
-    FrameBufferHeader* fbh = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation));
-    fbh->_usageCounter = fi->_bufferUsageCount;
-    FrameBufferHeader* fbhTail = reinterpret_cast<FrameBufferHeader*>(buf.get() + sizeof(FrameInformation) + in_cfg._frameSize);
-    fbhTail->_usageCounter = fi->_bufferUsageCount;
+    frame_buffer_header* fbh =
+        reinterpret_cast<frame_buffer_header*>(buf.get() + sizeof(frame_information));
+    fbh->usage_counter            = fi->buffer_usage_count;
+    frame_buffer_header* fbh_tail = reinterpret_cast<frame_buffer_header*>(
+        buf.get() + sizeof(frame_information) + cfg.frame_size);
+    fbh_tail->usage_counter = fi->buffer_usage_count;
 
     using namespace std::chrono;
-    auto nextTimePoint = steady_clock::now() + milliseconds{in_cfg._intervalMs};
+    auto next_time_point = steady_clock::now() + milliseconds{cfg.interval_ms};
 
     while (true)
     {
-        in_endpoint.receiveEmptyMessage();
+        endpoint.receive_empty_message();
 
-        ret = fi_send(in_endpoint._endpoint.get(), buf.get(), messageSize, fi_mr_desc(memoryRegion.get()),
-                      FI_ADDR_UNSPEC, nullptr);
+        ret = fi_send(endpoint.endpoint_.get(),
+                      buf.get(),
+                      message_size,
+                      fi_mr_desc(memory_region.get()),
+                      FI_ADDR_UNSPEC,
+                      nullptr);
         if (ret != 0)
         {
             throw rdma_error{"fi_recv", static_cast<int>(ret)};
         }
 
-        WaitResult waitResult = WaitResult::TIMEOUT;
-        bool nextRecvCompleted = false, sendCompleted = false;
-        milliseconds sendTimeout = SEND_TIMEOUT;
+        wait_result  wr                  = wait_result::TIMEOUT;
+        bool         next_recv_completed = false, send_completed = false;
+        milliseconds send_timeout = SEND_TIMEOUT;
 
-        while (sendTimeout.count() > 0)
+        while (send_timeout.count() > 0)
         {
-            const auto waitingStart = steady_clock::now();
-            ret = fi_cq_sread(in_endpoint._completionQueue.get(), &entry, 1, nullptr, static_cast<int>(sendTimeout.count()));
+            const auto waiting_start = steady_clock::now();
+            ret = fi_cq_sread(endpoint.completion_queue_.get(),
+                              &entry,
+                              1,
+                              nullptr,
+                              static_cast<int>(send_timeout.count()));
             if (ret == 1)
             {
                 if ((entry.flags & SEND_COMPLETION_FLAGS) == SEND_COMPLETION_FLAGS)
                 {
-                    sendCompleted = true;
+                    send_completed = true;
                 }
                 else if ((entry.flags & RECV_COMPLETION_FLAGS) == RECV_COMPLETION_FLAGS)
                 {
-                    nextRecvCompleted = true;
+                    next_recv_completed = true;
                 }
 
-                // Both send and receive were completed, we sent the message and the client is ready for the next message
-                if (sendCompleted && nextRecvCompleted)
+                // Both send and receive were completed, we sent the message and the client is ready
+                // for the next message
+                if (send_completed && next_recv_completed)
                 {
-                    waitResult = WaitResult::SENT_MESSAGE;
+                    wr = wait_result::SENT_MESSAGE;
                     break;
                 }
                 else
                 {
-                    // We receive first completion notification, adjust completion timeout for 2nd message
-                    sendTimeout -= duration_cast<milliseconds>(steady_clock::now() - waitingStart);
+                    // We receive first completion notification, adjust completion timeout for 2nd
+                    // message
+                    send_timeout -=
+                        duration_cast<milliseconds>(steady_clock::now() - waiting_start);
                 }
             }
             else if (ret == -FI_EAGAIN)
             {
-                ret = fi_eq_read(in_endpoint._eventQueue.get(), &event, cmEntry, cmEntrySize, 10U);
+                ret = fi_eq_read(endpoint.event_queue_.get(), &event, cm_entry, cm_entry_size, 10U);
                 if (ret > 0 && event == FI_SHUTDOWN)
                 {
                     std::cout << "Received SHUTDOWN from the peer\n";
-                    waitResult = WaitResult::SHUTDOWN;
+                    wr = wait_result::SHUTDOWN;
                 }
                 else
                 {
-                    waitResult = WaitResult::TIMEOUT;
+                    wr = wait_result::TIMEOUT;
                 }
                 break;
             }
             else
             {
-                std::string errorMessage;
-                int errorCode = (int)ret;
+                std::string error_message;
+                int         error_code = (int)ret;
                 if (ret == -FI_EAVAIL)
                 {
                     fi_cq_err_entry err{};
-                    fi_cq_readerr(in_endpoint._completionQueue.get(), &err, 0);
-                    errorCode = err.err;
+                    fi_cq_readerr(endpoint.completion_queue_.get(), &err, 0);
+                    error_code = err.err;
                     if (err.err_data_size > 0)
                     {
-                        errorMessage.assign((const char*)err.err_data, err.err_data_size);
+                        error_message.assign((const char*)err.err_data, err.err_data_size);
                     }
                 }
-                std::cout << "Error on CQ: " << fi_strerror(errorCode) <<  " (code: " << errorCode << ')';
-                if (!errorMessage.empty())
+                std::cout << "Error on CQ: " << fi_strerror(error_code) << " (code: " << error_code
+                          << ')';
+                if (!error_message.empty())
                 {
-                    std::cout << ". Message: " << errorMessage;
+                    std::cout << ". Message: " << error_message;
                 }
                 std::cout << std::endl;
 
-                waitResult = WaitResult::GOT_ERROR;
+                wr = wait_result::GOT_ERROR;
                 break;
             }
         }
 
-        if (waitResult != WaitResult::SENT_MESSAGE)
+        if (wr != wait_result::SENT_MESSAGE)
         {
-            if (waitResult == WaitResult::TIMEOUT)
+            if (wr == wait_result::TIMEOUT)
             {
-                std::cout << clientId << ": Timeout sending a payload message\n";
+                std::cout << client_id << ": Timeout sending a payload message\n";
             }
             break;
         }
 
-        numMessageSent += 1;
-        if (in_cfg._verbose)
+        num_message_sent += 1;
+        if (cfg.verbose)
         {
-            std::cout << clientId << ": Message (" << numMessageSent << ", " << messageSize << " bytes) sent to client.\n";
+            std::cout << client_id << ": Message (" << num_message_sent << ", " << message_size
+                      << " bytes) sent to client.\n";
         }
 
-        fi->_frameIndex = 10000 + numMessageSent;
-        fi->_bufferUsageCount = numMessageSent + 1;
-        fi->_flags = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
-        fbh->_usageCounter = fi->_bufferUsageCount;
-        fbhTail->_usageCounter = fi->_bufferUsageCount;
+        fi->frame_index         = 10000 + num_message_sent;
+        fi->buffer_usage_count  = num_message_sent + 1;
+        fi->flags               = FRAME_INFORMATION_FLAG_FLOW_HAS_ACTIVE_PRODUCERS;
+        fbh->usage_counter      = fi->buffer_usage_count;
+        fbh_tail->usage_counter = fi->buffer_usage_count;
 
-        std::this_thread::sleep_until(nextTimePoint);
-        nextTimePoint = nextTimePoint + milliseconds{in_cfg._intervalMs};
+        std::this_thread::sleep_until(next_time_point);
+        next_time_point = next_time_point + milliseconds{cfg.interval_ms};
     }
 
-    fi_shutdown(in_endpoint._endpoint.get(), 0U);
+    fi_shutdown(endpoint.endpoint_.get(), 0U);
 }
 
-void run(const AppOptions& in_cfg)
+void run(const app_options& cfg)
 {
-    auto fabricInfo = getFabricInfo(in_cfg._providerName, in_cfg._address, in_cfg._port);
-    RdmaAdapter adapter{std::move(fabricInfo)};
-    RdmaListeningEndpoint listeningEndpoint{adapter};
+    auto                    fabric_info = get_fabric_info(cfg.provider_name, cfg.address, cfg.port);
+    rdma_adapter            adapter{std::move(fabric_info)};
+    rdma_listening_endpoint listening_endpoint{adapter};
 
-    const auto entryMaxSize = listeningEndpoint.getMaxConnectionDataSize() + sizeof(fi_eq_cm_entry);
-    std::unique_ptr<uint8_t[]> connectBuffer = std::make_unique<uint8_t[]>(entryMaxSize);
-    fi_eq_cm_entry* entry = reinterpret_cast<fi_eq_cm_entry*>(connectBuffer.get());
-    uint32_t event = 0;
+    const auto entry_max_size =
+        listening_endpoint.max_connection_data_size() + sizeof(fi_eq_cm_entry);
+    std::unique_ptr<uint8_t[]> connet_buffer = std::make_unique<uint8_t[]>(entry_max_size);
+    fi_eq_cm_entry*            entry = reinterpret_cast<fi_eq_cm_entry*>(connet_buffer.get());
+    uint32_t                   event = 0;
 
     while (true)
     {
-        const auto eq = listeningEndpoint._eventQueue.get();
-        const ssize_t res = fi_eq_sread(eq, &event, entry, entryMaxSize, -1, 0);
+        const auto    eq  = listening_endpoint.event_queue_.get();
+        const ssize_t res = fi_eq_sread(eq, &event, entry, entry_max_size, -1, 0);
         if (res == -FI_EAGAIN || res == -FI_EINTR)
         {
             continue;
@@ -262,23 +292,24 @@ void run(const AppOptions& in_cfg)
 
         if (res < 0)
         {
-            std::string errorMessage;
-            int errorCode = (int)res;
+            std::string error_message;
+            int         error_code = (int)res;
             if (res == -FI_EAVAIL)
             {
                 fi_eq_err_entry err{};
                 fi_eq_readerr(eq, &err, 0);
-                errorCode = err.err;
+                error_code = err.err;
                 if (err.err_data_size > 0)
                 {
-                    errorMessage.assign((const char*)err.err_data, err.err_data_size);
+                    error_message.assign((const char*)err.err_data, err.err_data_size);
                 }
             }
 
-            std::cout << "Error calling fi_eq_sread(): " << fi_strerror(errorCode) << " (code: " << errorCode << ")";
-            if (!errorMessage.empty())
+            std::cout << "Error calling fi_eq_sread(): " << fi_strerror(error_code)
+                      << " (code: " << error_code << ")";
+            if (!error_message.empty())
             {
-                std::cout << ". Message: " << errorMessage;
+                std::cout << ". Message: " << error_message;
             }
             std::cout << std::endl;
             continue;
@@ -289,153 +320,165 @@ void run(const AppOptions& in_cfg)
             continue;
         }
 
-        std::unique_ptr<fi_info> entryRaii{entry->info};
+        std::unique_ptr<fi_info> entry_raii{entry->info};
         if (static_cast<size_t>(res) < sizeof(*entry))
         {
             std::cout << "Unexpected size of connection data: " << res << std::endl;
             continue;
         }
 
-        const auto connectionDataSize = res - sizeof(*entry);
-        std::string inboundAddr;
+        const auto  connection_data_size = res - sizeof(*entry);
+        std::string inbound_addr;
         if (entry->info->dest_addrlen == INET_ADDRSTRLEN)
         {
-            inboundAddr.resize(INET_ADDRSTRLEN);
-            auto* sockAddr = reinterpret_cast<sockaddr_in*>(entry->info->dest_addr);
-            inet_ntop(AF_INET, &sockAddr->sin_addr, inboundAddr.data(), inboundAddr.size());
+            inbound_addr.resize(INET_ADDRSTRLEN);
+            auto* sock_addr = reinterpret_cast<sockaddr_in*>(entry->info->dest_addr);
+            inet_ntop(AF_INET, &sock_addr->sin_addr, inbound_addr.data(), inbound_addr.size());
         }
         else if (entry->info->dest_addrlen == INET6_ADDRSTRLEN)
         {
-            inboundAddr.resize(INET6_ADDRSTRLEN);
-            auto* sockAddr = reinterpret_cast<sockaddr_in6*>(entry->info->dest_addr);
-            inet_ntop(AF_INET6, &sockAddr->sin6_addr, inboundAddr.data(), inboundAddr.size());
+            inbound_addr.resize(INET6_ADDRSTRLEN);
+            auto* sock_addr = reinterpret_cast<sockaddr_in6*>(entry->info->dest_addr);
+            inet_ntop(AF_INET6, &sock_addr->sin6_addr, inbound_addr.data(), inbound_addr.size());
         }
-        std::cout << "Connection inbound (" << inboundAddr << "). Received extra bytes: " << connectionDataSize << std::endl;
+        std::cout << "Connection inbound (" << inbound_addr
+                  << "). Received extra bytes: " << connection_data_size << std::endl;
 
-        std::stringstream errorMessageStream;
+        std::stringstream error_message_stream;
 
-        if (connectionDataSize >= sizeof(ClientConnection))
+        if (connection_data_size >= sizeof(client_connection))
         {
-            ClientConnection clientConnectionData;
-            std::memcpy(&clientConnectionData, entry->data, sizeof(ClientConnection));
-            if (clientConnectionData._identifier == PROTOCOL_IDENTIFIER)
+            client_connection client_connection_data;
+            std::memcpy(&client_connection_data, entry->data, sizeof(client_connection));
+            if (client_connection_data.identifier == PROTOCOL_IDENTIFIER)
             {
-                if (connectionDataSize >= sizeof(ClientConnectionFlowV1))
+                if (connection_data_size >= sizeof(client_connection_flow_v1))
                 {
-                    ClientConnectionFlowV1B clientConnectionV1{};
-                    if (connectionDataSize >= sizeof(ClientConnectionFlowV1B))
+                    client_connection_flow_v1b client_connection_v1{};
+                    if (connection_data_size >= sizeof(client_connection_flow_v1b))
                     {
-                        std::memcpy(&clientConnectionV1, entry->data, sizeof(ClientConnectionFlowV1B));
+                        std::memcpy(
+                            &client_connection_v1, entry->data, sizeof(client_connection_flow_v1b));
                     }
                     else
                     {
 #if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wclass-memaccess"
 #endif
-                        std::memcpy(&clientConnectionV1, entry->data, sizeof(ClientConnectionFlowV1));
+                        std::memcpy(
+                            &client_connection_v1, entry->data, sizeof(client_connection_flow_v1));
 #if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
+#  pragma GCC diagnostic pop
 #endif
                     }
 
-                    char flowId[32 + 4 + 1];
-                    std::sprintf(flowId, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                        clientConnectionV1._flowIdentifier[0],
-                        clientConnectionV1._flowIdentifier[1],
-                        clientConnectionV1._flowIdentifier[2],
-                        clientConnectionV1._flowIdentifier[3],
-                        clientConnectionV1._flowIdentifier[4],
-                        clientConnectionV1._flowIdentifier[5],
-                        clientConnectionV1._flowIdentifier[6],
-                        clientConnectionV1._flowIdentifier[7],
-                        clientConnectionV1._flowIdentifier[8],
-                        clientConnectionV1._flowIdentifier[9],
-                        clientConnectionV1._flowIdentifier[10],
-                        clientConnectionV1._flowIdentifier[11],
-                        clientConnectionV1._flowIdentifier[12],
-                        clientConnectionV1._flowIdentifier[13],
-                        clientConnectionV1._flowIdentifier[14],
-                        clientConnectionV1._flowIdentifier[15]);
+                    char flow_id[32 + 4 + 1];
+                    std::sprintf(
+                        flow_id,
+                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                        client_connection_v1.flow_id[0],
+                        client_connection_v1.flow_id[1],
+                        client_connection_v1.flow_id[2],
+                        client_connection_v1.flow_id[3],
+                        client_connection_v1.flow_id[4],
+                        client_connection_v1.flow_id[5],
+                        client_connection_v1.flow_id[6],
+                        client_connection_v1.flow_id[7],
+                        client_connection_v1.flow_id[8],
+                        client_connection_v1.flow_id[9],
+                        client_connection_v1.flow_id[10],
+                        client_connection_v1.flow_id[11],
+                        client_connection_v1.flow_id[12],
+                        client_connection_v1.flow_id[13],
+                        client_connection_v1.flow_id[14],
+                        client_connection_v1.flow_id[15]);
 
                     std::cout << "Connection data:"
-                              << "\n  Flow identifier: " << flowId
-                              << "\n  Wants metadata: " << std::boolalpha << clientConnectionV1._wantsFrameMetadata << std::endl;
+                              << "\n  Flow identifier: " << flow_id
+                              << "\n  Wants metadata: " << std::boolalpha
+                              << client_connection_v1.wants_frame_metadata << std::endl;
 
-                    if (!std::strcmp(flowId, "e569f502-8891-4c9f-92d4-51702b158bd5"))
+                    if (!std::strcmp(flow_id, "e569f502-8891-4c9f-92d4-51702b158bd5"))
                     {
                         try
                         {
-                            std::thread th{[ep = RdmaEndpoint{adapter, *entry->info}, in_cfg]() mutable -> void {
-                                handleConnection(ep, in_cfg);
-                            }};
+                            std::thread th{
+                                [ep = rdma_endpoint{adapter, *entry->info}, cfg]() mutable -> void {
+                                    handle_connection(ep, cfg);
+                                }};
                             th.detach();
                         }
                         catch (const std::exception& ex)
                         {
-                            std::cout << "EXCEPTION when creating RdmaEndpoint: " << ex.what() << std::endl;
-                            errorMessageStream << "EXCEPTION when creating RdmaEndpoint";
+                            std::cout << "EXCEPTION when creating rdma_endpoint: " << ex.what()
+                                      << std::endl;
+                            error_message_stream << "EXCEPTION when creating rdma_endpoint";
                         }
                     }
                     else
                     {
-                        errorMessageStream << "Flow does not exist";
+                        error_message_stream << "Flow does not exist";
                     }
                 }
                 else
                 {
-                    errorMessageStream << "Received wrong private data size for FlowV1 connection (expected "
-                                        << sizeof(ClientConnectionFlowV1) << " but received " << connectionDataSize
-                                        << ")";
+                    error_message_stream
+                        << "Received wrong private data size for FlowV1 connection (expected "
+                        << sizeof(client_connection_flow_v1) << " but received "
+                        << connection_data_size << ")";
                 }
             }
             else
             {
-                errorMessageStream << "Unknown protocol identifier " << clientConnectionData._identifier;
+                error_message_stream << "Unknown protocol identifier "
+                                     << client_connection_data.identifier;
             }
 
-            auto errorMessage = errorMessageStream.str();
-            if (!errorMessage.empty())
+            auto error_message = error_message_stream.str();
+            if (!error_message.empty())
             {
-                std::cout << "Connection rejected: " << errorMessage << std::endl;
-                if (errorMessage.size() > entryMaxSize - 1)
+                std::cout << "Connection rejected: " << error_message << std::endl;
+                if (error_message.size() > entry_max_size - 1)
                 {
-                    errorMessage.resize(entryMaxSize - 1);
+                    error_message.resize(entry_max_size - 1);
                 }
-                fi_reject(listeningEndpoint._passiveEndpoint.get(), entry->info->handle,
-                          errorMessage.c_str(), errorMessage.size() + 1);
+                fi_reject(listening_endpoint.passive_endpoint_.get(),
+                          entry->info->handle,
+                          error_message.c_str(),
+                          error_message.size() + 1);
             }
         }
         else
         {
-            std::cout << "GetConnectionData failed, connectionDataSize = " << connectionDataSize
+            std::cout << "GetConnectionData failed, connection data size = " << connection_data_size
                       << ". Connection will be rejected." << std::endl;
-            fi_reject(listeningEndpoint._passiveEndpoint.get(), entry->info->handle, nullptr, 0);
+            fi_reject(listening_endpoint.passive_endpoint_.get(), entry->info->handle, nullptr, 0);
         }
     }
 }
 
 int main(int argc, char* argv[])
 {
-    AppOptions options;
+    app_options options;
 
     int opt;
     while ((opt = getopt(argc, argv, "a:B:p:s:t:v")) != -1)
     {
         switch (opt)
         {
-        case 'a': options._address = optarg; break;
-        case 'B': options._port = optarg; break;
-        case 'p': options._providerName = optarg; break;
-        case 's': options._frameSize = (unsigned)std::atoi(optarg); break;
-        case 't': options._intervalMs = std::atoi(optarg); break;
-        case 'v': options._verbose = true; break;
+        case 'a': options.address = optarg; break;
+        case 'B': options.port = optarg; break;
+        case 'p': options.provider_name = optarg; break;
+        case 's': options.frame_size = (unsigned)std::atoi(optarg); break;
+        case 't': options.interval_ms = std::atoi(optarg); break;
+        case 'v': options.verbose = true; break;
         case '?': std::cerr << "Unknown option: " << char(optopt) << std::endl; return 1;
         default:  return 1;
         }
     }
 
-    if (options._address.empty())
+    if (options.address.empty())
     {
         std::cerr << "Address (-a) must be provided" << std::endl;
         return 1;

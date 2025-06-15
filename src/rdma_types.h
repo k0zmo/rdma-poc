@@ -8,248 +8,247 @@
 #include <rdma/fi_errno.h>
 
 #ifndef _WIN32
-#  include <sys/types.h>
 #  include <arpa/inet.h>
 #  include <netinet/in.h>
 #  include <sys/socket.h>
+#  include <sys/types.h>
 #else
-#include <ws2tcpip.h>
+#  include <ws2tcpip.h>
 #endif
 
 #include <algorithm>
-#include <cstdint>
-#include <cstdio>
-#include <string.h>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string.h>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#define DEBUG_LOG(...)                                                                                                 \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        using namespace std::chrono;                                                                                   \
-        const auto tp = system_clock::now();                                                                           \
-        const auto millis = duration_cast<milliseconds>(tp.time_since_epoch()).count() % 1000LL;                       \
-        std::time_t time_tt = system_clock::to_time_t(tp);                                                             \
-        std::tm t{};                                                                                                   \
-        ::localtime_r(&time_tt, &t);                                                                                   \
-        char buffer[512];                                                                                              \
-        auto len = strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &t);                                          \
-        len += std::sprintf(buffer + len, ".%03u ", static_cast<unsigned>(millis));                                    \
-        std::sprintf(buffer + len, __VA_ARGS__);                                                                       \
-        std::fprintf(stdout, "%s\n", buffer);                                                                          \
-        std::fflush(stdout);                                                                                           \
+#define LOG_DEBUG(...)                                                                             \
+    do                                                                                             \
+    {                                                                                              \
+        using namespace std::chrono;                                                               \
+        const auto  tp      = system_clock::now();                                                 \
+        const auto  millis  = duration_cast<milliseconds>(tp.time_since_epoch()).count() % 1000LL; \
+        std::time_t time_tt = system_clock::to_time_t(tp);                                         \
+        std::tm     t{};                                                                           \
+        ::localtime_r(&time_tt, &t);                                                               \
+        char buffer[512];                                                                          \
+        auto len = strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &t);                      \
+        len += std::sprintf(buffer + len, ".%03u ", static_cast<unsigned>(millis));                \
+        std::sprintf(buffer + len, __VA_ARGS__);                                                   \
+        std::fprintf(stdout, "%s\n", buffer);                                                      \
+        std::fflush(stdout);                                                                       \
     } while (0);
 
 inline const auto FABRIC_VERSION = FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION);
 
 // Deleter that works for any type from libfabric but fi_info
 template <typename T>
-struct FabricInterfaceDeleter
+struct fabric_interface_deleter
 {
-    void operator()(T* in_pointer)
+    void operator()(T* pointer)
     {
-        if (in_pointer)
+        if (pointer)
         {
-            int res = fi_close(&in_pointer->fid);
+            int res = fi_close(&pointer->fid);
             if (res != 0)
             {
-                DEBUG_LOG("fi_close failed: %s (%d)", fi_strerror(res), res);
+                LOG_DEBUG("fi_close failed: %s (%d)", fi_strerror(res), res);
             }
         }
     }
 };
 
 template <>
-struct FabricInterfaceDeleter<fi_info>
+struct fabric_interface_deleter<fi_info>
 {
-    void operator()(fi_info* in_pointer)
+    void operator()(fi_info* pointer)
     {
-        if (in_pointer)
+        if (pointer)
         {
-            fi_freeinfo(in_pointer);
+            fi_freeinfo(pointer);
         }
     }
 };
 
 namespace std {
 
-template <> struct default_delete<fi_info>    : FabricInterfaceDeleter<fi_info> {};
-template <> struct default_delete<fid_fabric> : FabricInterfaceDeleter<fid_fabric> {};
-template <> struct default_delete<fid_domain> : FabricInterfaceDeleter<fid_domain> {};
-template <> struct default_delete<fid_eq>     : FabricInterfaceDeleter<fid_eq> {};
-template <> struct default_delete<fid_pep>    : FabricInterfaceDeleter<fid_pep> {};
-template <> struct default_delete<fid_ep>     : FabricInterfaceDeleter<fid_ep> {};
-template <> struct default_delete<fid_cq>     : FabricInterfaceDeleter<fid_cq> {};
-template <> struct default_delete<fid_mr>     : FabricInterfaceDeleter<fid_mr> {};
-template <> struct default_delete<fid_av>     : FabricInterfaceDeleter<fid_av> {};
-template <> struct default_delete<fid_cntr>   : FabricInterfaceDeleter<fid_cntr> {};
+template <> struct default_delete<fi_info>    : fabric_interface_deleter<fi_info>    {};
+template <> struct default_delete<fid_fabric> : fabric_interface_deleter<fid_fabric> {};
+template <> struct default_delete<fid_domain> : fabric_interface_deleter<fid_domain> {};
+template <> struct default_delete<fid_eq>     : fabric_interface_deleter<fid_eq>     {};
+template <> struct default_delete<fid_pep>    : fabric_interface_deleter<fid_pep>    {};
+template <> struct default_delete<fid_ep>     : fabric_interface_deleter<fid_ep>     {};
+template <> struct default_delete<fid_cq>     : fabric_interface_deleter<fid_cq>     {};
+template <> struct default_delete<fid_mr>     : fabric_interface_deleter<fid_mr>     {};
+template <> struct default_delete<fid_av>     : fabric_interface_deleter<fid_av>     {};
+template <> struct default_delete<fid_cntr>   : fabric_interface_deleter<fid_cntr>   {};
 
 } // namespace std
 
 // Utility class for passing out pointer to constructor-like functions.
-// Shouldn't be used directly but with `makeOutPointer` wrapper function
+// Shouldn't be used directly but with `make_out_pointer` wrapper function
 // that does the type deduction.
 template <typename SmartPointer>
-class OutPointer
+class out_pointer
 {
 public:
     using element_type = typename SmartPointer::element_type;
     using pointer_type = std::add_pointer_t<element_type>;
 
-    explicit OutPointer(SmartPointer& inout_pointer)
-        : _smartPointer{inout_pointer}
-        , _rawPointer{nullptr}
+    explicit out_pointer(SmartPointer& pointer) :
+        smart_pointer_{pointer},
+        raw_pointer_{nullptr}
     {
-        _smartPointer.reset();
+        smart_pointer_.reset();
     }
 
-    ~OutPointer()
+    ~out_pointer()
     {
-        if (_rawPointer)
+        if (raw_pointer_)
         {
-            _smartPointer.reset(_rawPointer);
+            smart_pointer_.reset(raw_pointer_);
         }
     }
 
-    OutPointer(const OutPointer&) = delete;
-    OutPointer& operator=(const OutPointer&) = delete;
+    out_pointer(const out_pointer&)            = delete;
+    out_pointer& operator=(const out_pointer&) = delete;
 
-    operator pointer_type*() { return &_rawPointer; }
-    operator void**() { return reinterpret_cast<void**>(&_rawPointer); }
+    operator pointer_type*() { return &raw_pointer_; }
+
+    operator void**() { return reinterpret_cast<void**>(&raw_pointer_); }
 
 private:
-    SmartPointer& _smartPointer;
-    pointer_type _rawPointer;
+    SmartPointer& smart_pointer_;
+    pointer_type  raw_pointer_;
 };
 
 template <typename SmartPointer, typename Deleter>
-class OutPointerWithDynamicDeleter
+class out_pointer_with_dynamic_deleter
 {
 public:
     using element_type = typename SmartPointer::element_type;
     using pointer_type = std::add_pointer_t<element_type>;
 
-    explicit OutPointerWithDynamicDeleter(SmartPointer& inout_pointer, Deleter in_deleter)
-        : _smartPointer{inout_pointer}
-        , _rawPointer{nullptr}
-        , _deleter{std::move(in_deleter)}
+    explicit out_pointer_with_dynamic_deleter(SmartPointer& pointer, Deleter deleter) :
+        smart_pointer_{pointer},
+        raw_pointer_{nullptr},
+        deleter_{std::move(deleter)}
     {
-        _smartPointer.reset();
+        smart_pointer_.reset();
     }
 
-    ~OutPointerWithDynamicDeleter()
+    ~out_pointer_with_dynamic_deleter()
     {
-        if (_rawPointer)
+        if (raw_pointer_)
         {
-            _smartPointer.reset(_rawPointer, std::move(_deleter));
+            smart_pointer_.reset(raw_pointer_, std::move(deleter_));
         }
     }
 
-    OutPointerWithDynamicDeleter(const OutPointerWithDynamicDeleter&) = delete;
-    OutPointerWithDynamicDeleter& operator=(const OutPointerWithDynamicDeleter&) = delete;
+    out_pointer_with_dynamic_deleter(const out_pointer_with_dynamic_deleter&)            = delete;
+    out_pointer_with_dynamic_deleter& operator=(const out_pointer_with_dynamic_deleter&) = delete;
 
-    operator pointer_type*() { return &_rawPointer; }
-    operator void**() { return reinterpret_cast<void**>(&_rawPointer); }
+    operator pointer_type*() { return &raw_pointer_; }
+
+    operator void**() { return reinterpret_cast<void**>(&raw_pointer_); }
 
 private:
-    SmartPointer& _smartPointer;
-    pointer_type _rawPointer;
-    Deleter _deleter;
+    SmartPointer& smart_pointer_;
+    pointer_type  raw_pointer_;
+    Deleter       deleter_;
 };
 
 template <typename SmartPointer>
-OutPointer<SmartPointer>
-makeOutPointer(SmartPointer& inout_pointer)
+out_pointer<SmartPointer> make_out_pointer(SmartPointer& pointer)
 {
-    return OutPointer<SmartPointer>(inout_pointer);
+    return out_pointer<SmartPointer>(pointer);
 }
 
 template <typename SmartPointer, typename Deleter>
-OutPointerWithDynamicDeleter<SmartPointer, Deleter>
-makeOutPointer(SmartPointer& inout_pointer, Deleter in_deleter)
+out_pointer_with_dynamic_deleter<SmartPointer, Deleter> make_out_pointer(SmartPointer& pointer,
+                                                                         Deleter       deleter)
 {
-    return OutPointerWithDynamicDeleter<SmartPointer, Deleter>(inout_pointer, std::move(in_deleter));
+    return out_pointer_with_dynamic_deleter<SmartPointer, Deleter>(pointer, std::move(deleter));
 }
 
 template <typename T>
-auto
-makeOutPointer(std::shared_ptr<T>& inout_pointer)
+auto make_out_pointer(std::shared_ptr<T>& pointer)
 {
-    return makeOutPointer(inout_pointer, FabricInterfaceDeleter<T>{});
+    return make_out_pointer(pointer, fabric_interface_deleter<T>{});
 }
 
 struct rdma_error : std::runtime_error
 {
-    explicit rdma_error(const char* in_functionName, int in_errorCode)
-        : std::runtime_error{formatErrorMessage(in_functionName, in_errorCode)}
+    explicit rdma_error(const char* function_name, int error_code) :
+        std::runtime_error{format_error_message(function_name, error_code)}
     {
     }
 
 private:
-    static std::string formatErrorMessage(const char* in_functionName,
-                                          int in_errorCode)
+    static std::string format_error_message(const char* function_name, int error_code)
     {
         std::stringstream ss;
-        ss << in_functionName << " returned: '" << fi_strerror(in_errorCode)
-           << " (" << in_errorCode << ")'";
+        ss << function_name << " returned: '" << fi_strerror(error_code) << " (" << error_code
+           << ")'";
         return ss.str();
     }
 };
 
 template <typename T>
-fid_t toFid(const T& in_fabricInterface)
+fid_t to_fid(const T& fabric_interface)
 {
-    return &in_fabricInterface.get()->fid;
+    return &fabric_interface.get()->fid;
 }
 
-inline std::shared_ptr<fi_info> createFabricInfoHints(const std::string& in_providerName,
-                                                      const std::string& in_srcAddress)
+inline std::shared_ptr<fi_info> create_fabric_info_hints(const std::string& provider_name,
+                                                         const std::string& src_address)
 {
-    fi_info* rawHints = fi_allocinfo();
-    if ( !rawHints )
+    fi_info* raw_hints = fi_allocinfo();
+    if (!raw_hints)
     {
         throw rdma_error{"hints is null", -FI_ENOMEM};
     }
-    std::shared_ptr<fi_info> hints{rawHints, fi_freeinfo};
+    std::shared_ptr<fi_info> hints{raw_hints, fi_freeinfo};
 
-    if (!in_providerName.empty())
+    if (!provider_name.empty())
     {
-        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
     }
-    hints->ep_attr->type = FI_EP_MSG;
-    hints->caps = FI_MSG;
+    hints->ep_attr->type        = FI_EP_MSG;
+    hints->caps                 = FI_MSG;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
-    hints->rx_attr->iov_limit = 4;
-    hints->tx_attr->iov_limit = 4;
+    hints->rx_attr->iov_limit   = 4;
+    hints->tx_attr->iov_limit   = 4;
 
-    if (!in_srcAddress.empty())
+    if (!src_address.empty())
     {
-        in_addr srcAddr{};
-        if (inet_pton(AF_INET, in_srcAddress.c_str(), &srcAddr) == 1)
+        in_addr src_addr{};
+        if (inet_pton(AF_INET, src_address.c_str(), &src_addr) == 1)
         {
             sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(malloc(sizeof(sockaddr_in)));
             memset(addr, 0, sizeof(sockaddr_in));
-            addr->sin_addr = srcAddr;
-            addr->sin_family = AF_INET;
+            addr->sin_addr     = src_addr;
+            addr->sin_family   = AF_INET;
             hints->addr_format = FI_SOCKADDR_IN;
-            hints->src_addr = addr; // libfabric release it by calling free()
+            hints->src_addr    = addr;
             hints->src_addrlen = sizeof(sockaddr_in);
         }
         else
         {
-            // TODO ipv6
             throw rdma_error{"Invalid source address", -FI_ENODATA};
         }
     }
@@ -257,92 +256,98 @@ inline std::shared_ptr<fi_info> createFabricInfoHints(const std::string& in_prov
     return hints;
 }
 
-inline std::shared_ptr<fi_info> createFabricInfoHintsRdm(const std::string& in_providerName)
+inline std::shared_ptr<fi_info> create_fabric_info_hints_rdm(const std::string& provider_name)
 {
-    fi_info* rawHints = fi_allocinfo();
-    if ( !rawHints )
+    fi_info* raw_hints = fi_allocinfo();
+    if (!raw_hints)
     {
         throw rdma_error{"hints is null", -FI_ENOMEM};
     }
-    std::shared_ptr<fi_info> hints{rawHints, fi_freeinfo};
+    std::shared_ptr<fi_info> hints{raw_hints, fi_freeinfo};
 
-    if (!in_providerName.empty())
+    if (!provider_name.empty())
     {
-        hints->fabric_attr->prov_name = strdup(in_providerName.c_str());
+        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
     }
-    hints->ep_attr->type = FI_EP_RDM;
-    hints->caps = FI_MSG | FI_RECV | FI_SEND | FI_REMOTE_COMM; // | FI_TAGGED
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
+    hints->ep_attr->type         = FI_EP_RDM;
+    hints->caps                  = FI_MSG | FI_RECV | FI_SEND | FI_REMOTE_COMM;
+    hints->domain_attr->mr_mode  = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
     hints->domain_attr->progress = FI_PROGRESS_MANUAL;
-    //hints->domain_attr->threading = FI_THREAD_COMPLETION;
     hints->domain_attr->threading = FI_THREAD_SAFE;
-    hints->rx_attr->iov_limit = 4;
-    hints->tx_attr->iov_limit = 4;
+    hints->rx_attr->iov_limit     = 4;
+    hints->tx_attr->iov_limit     = 4;
 
     return hints;
 }
 
-
-inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
-                                              const std::string& in_destAddress,
-                                              const std::string& in_destPort,
-                                              const std::string& in_srcAddress)
+inline std::shared_ptr<fi_info> get_fabric_info(const std::string& provider_name,
+                                                const std::string& dest_address,
+                                                const std::string& dest_port,
+                                                const std::string& src_address)
 {
-    std::shared_ptr<fi_info> hints = createFabricInfoHints(in_providerName, in_srcAddress);
-    std::shared_ptr<fi_info> fabricInfo;
-    int res = fi_getinfo(FABRIC_VERSION, in_destAddress.c_str(), in_destPort.c_str(),
-                         0U, hints.get(), makeOutPointer(fabricInfo));
+    std::shared_ptr<fi_info> hints = create_fabric_info_hints(provider_name, src_address);
+    std::shared_ptr<fi_info> fabric_info;
+    int res = fi_getinfo(FABRIC_VERSION,
+                         dest_address.c_str(),
+                         dest_port.c_str(),
+                         0U,
+                         hints.get(),
+                         make_out_pointer(fabric_info));
     if (res != 0)
     {
         throw rdma_error{"fi_getinfo", res};
     }
 
-    if (!strcmp(fabricInfo->fabric_attr->prov_name, "tcp"))
+    if (!strcmp(fabric_info->fabric_attr->prov_name, "tcp"))
     {
-        fabricInfo->domain_attr->mr_mode |= FI_MR_PROV_KEY;
+        fabric_info->domain_attr->mr_mode |= FI_MR_PROV_KEY;
     }
 
-    return fabricInfo;
+    return fabric_info;
 }
 
-inline std::shared_ptr<fi_info> getFabricInfo(const std::string& in_providerName,
-                                              const std::string& in_srcAddress,
-                                              const std::string& in_srcPort)
+inline std::shared_ptr<fi_info> get_fabric_info(const std::string& provider_name,
+                                                const std::string& src_address,
+                                                const std::string& src_port)
 {
-    std::shared_ptr<fi_info> hints = createFabricInfoHints(in_providerName, "");
-    std::shared_ptr<fi_info> fabricInfo;
-    int res = fi_getinfo(FABRIC_VERSION, in_srcAddress.c_str(), in_srcPort.c_str(),
-                         FI_SOURCE, hints.get(), makeOutPointer(fabricInfo));
+    std::shared_ptr<fi_info> hints = create_fabric_info_hints(provider_name, "");
+    std::shared_ptr<fi_info> fabric_info;
+    int res = fi_getinfo(FABRIC_VERSION,
+                         src_address.c_str(),
+                         src_port.c_str(),
+                         FI_SOURCE,
+                         hints.get(),
+                         make_out_pointer(fabric_info));
     if (res != 0)
     {
         throw rdma_error{"fi_getinfo", res};
     }
 
-    if (!strcmp(fabricInfo->fabric_attr->prov_name, "tcp"))
+    if (!strcmp(fabric_info->fabric_attr->prov_name, "tcp"))
     {
-        fabricInfo->domain_attr->mr_mode |= FI_MR_PROV_KEY;
+        fabric_info->domain_attr->mr_mode |= FI_MR_PROV_KEY;
     }
 
-    return fabricInfo;
+    return fabric_info;
 }
 
-struct RdmaAdapter
+struct rdma_adapter
 {
-    std::shared_ptr<fi_info>    _fabricInfo;
-    std::shared_ptr<fid_fabric> _fabric;
-    std::shared_ptr<fid_domain> _domain;
+    std::shared_ptr<fi_info>    fabric_info_;
+    std::shared_ptr<fid_fabric> fabric_;
+    std::shared_ptr<fid_domain> domain_;
 
-    RdmaAdapter(std::shared_ptr<fi_info> in_fabricInfo)
-        : _fabricInfo{std::move(in_fabricInfo)}
+    explicit rdma_adapter(std::shared_ptr<fi_info> fabric_info) :
+        fabric_info_{std::move(fabric_info)}
     {
-        int res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
+        int res = fi_fabric(fabric_info_->fabric_attr, make_out_pointer(fabric_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_fabric", res};
         }
 
         std::shared_ptr<fid_domain> domain;
-        res = fi_domain(_fabric.get(), _fabricInfo.get(), makeOutPointer(_domain), nullptr);
+        res = fi_domain(fabric_.get(), fabric_info_.get(), make_out_pointer(domain_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_domain", res};
@@ -350,325 +355,330 @@ struct RdmaAdapter
     }
 };
 
-struct RdmaEndpoint
+struct rdma_endpoint
 {
-    std::shared_ptr<fid_domain> _domain;
-    std::shared_ptr<fid_fabric> _fabric;
+    std::shared_ptr<fid_domain> domain_;
+    std::shared_ptr<fid_fabric> fabric_;
 
-    std::unique_ptr<fid_eq>     _eventQueue;
-    std::unique_ptr<fid_cq>     _completionQueue;
-    std::unique_ptr<fid_ep>     _endpoint; // must be before EQ and CQ
+    std::unique_ptr<fid_eq> event_queue_;
+    std::unique_ptr<fid_cq> completion_queue_;
+    std::unique_ptr<fid_ep> endpoint_; // must be before EQ and CQ
 
-    RdmaEndpoint(const RdmaAdapter& in_adapter)
-        : RdmaEndpoint(in_adapter, *in_adapter._fabricInfo)
+    explicit rdma_endpoint(const rdma_adapter& adapter) :
+        rdma_endpoint(adapter, *adapter.fabric_info_)
     {
     }
 
-    RdmaEndpoint(const RdmaAdapter& in_adapter, const fi_info& in_fabricInfo)
-        : _domain{in_adapter._domain}
-        , _fabric{in_adapter._fabric}
+    rdma_endpoint(const rdma_adapter& adapter, const fi_info& fabric_info) :
+        domain_{adapter.domain_},
+        fabric_{adapter.fabric_}
     {
-        assert(in_fabricInfo.ep_attr->type == FI_EP_MSG);
+        assert(fabric_info.ep_attr->type == FI_EP_MSG);
 
-        int res = fi_endpoint(_domain.get(), const_cast<fi_info*>(&in_fabricInfo), makeOutPointer(_endpoint), nullptr);
+        int res = fi_endpoint(domain_.get(),
+                              const_cast<fi_info*>(&fabric_info),
+                              make_out_pointer(endpoint_),
+                              nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_endpoint", res};
         }
 
-        fi_eq_attr eqAttrs = {};
-        eqAttrs.wait_obj = FI_WAIT_UNSPEC;
-        res = fi_eq_open(_fabric.get(), &eqAttrs, makeOutPointer(_eventQueue), nullptr);
+        fi_eq_attr eq_attrs = {};
+        eq_attrs.wait_obj   = FI_WAIT_UNSPEC;
+        res = fi_eq_open(fabric_.get(), &eq_attrs, make_out_pointer(event_queue_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_eq_open", res};
         }
 
-        fi_cq_attr cqAttrs = {};
-        cqAttrs.size = 4; // Derived from the protocol requirements
-                          // (we expect max two completions at given time) times two
-        cqAttrs.wait_obj = FI_WAIT_UNSPEC;
-        cqAttrs.format = FI_CQ_FORMAT_MSG;
-        res = fi_cq_open(_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
+        fi_cq_attr cq_attrs = {};
+        cq_attrs.size       = 4; // Derived from the protocol requirements
+                                 // (we expect max two completions at given time) times two
+        cq_attrs.wait_obj = FI_WAIT_UNSPEC;
+        cq_attrs.format   = FI_CQ_FORMAT_MSG;
+        res = fi_cq_open(domain_.get(), &cq_attrs, make_out_pointer(completion_queue_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_cq_open", res};
         }
 
-        res = fi_ep_bind(_endpoint.get(), toFid(_eventQueue), 0);
+        res = fi_ep_bind(endpoint_.get(), to_fid(event_queue_), 0);
         if (res != 0)
         {
             throw rdma_error{"fi_ep_bind to EQ", res};
         }
-        res = fi_ep_bind(_endpoint.get(), toFid(_completionQueue), FI_RECV | FI_SEND);
+        res = fi_ep_bind(endpoint_.get(), to_fid(completion_queue_), FI_RECV | FI_SEND);
         if (res != 0)
         {
             throw rdma_error{"fi_ep_bind to CQ", res};
         }
         // We want to post receive before accepting a connection.
-        res = fi_enable(_endpoint.get());
+        res = fi_enable(endpoint_.get());
         if (res != 0)
         {
             throw rdma_error{"fi_enable", res};
         }
     }
 
-    void receiveEmptyMessage()
+    void receive_empty_message()
     {
-        ssize_t res = fi_recv(_endpoint.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
+        ssize_t res = fi_recv(endpoint_.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_recv", static_cast<int>(res)};
         }
     }
 
-    void sendEmptyMessage()
+    void send_empty_message()
     {
-        ssize_t res = fi_send(_endpoint.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
+        ssize_t res = fi_send(endpoint_.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_send", static_cast<int>(res)};
         }
     }
 
-    size_t getMaxConnectionDataSize() const
+    size_t max_connection_data_size() const
     {
-        size_t maxConnectionDataSize = 0;
-        size_t maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
-        int res = fi_getopt(toFid(_endpoint), FI_OPT_ENDPOINT,
-                            FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
+        size_t value        = 0;
+        size_t value_length = sizeof(value);
+        int    res          = fi_getopt(
+            to_fid(endpoint_), FI_OPT_ENDPOINT, FI_OPT_CM_DATA_SIZE, &value, &value_length);
         if (res != 0)
         {
             throw rdma_error{"fi_getopt", res};
         }
-        return maxConnectionDataSize;
+        return value;
     }
 };
 
-struct RdmaListeningEndpoint
+struct rdma_listening_endpoint
 {
-    std::shared_ptr<fid_fabric> _fabric;
+    std::shared_ptr<fid_fabric> fabric_;
 
-    std::unique_ptr<fid_eq>  _eventQueue;
-    std::unique_ptr<fid_pep> _passiveEndpoint; // must be before EQ
+    std::unique_ptr<fid_eq>  event_queue_;
+    std::unique_ptr<fid_pep> passive_endpoint_; // must be before EQ
 
-    RdmaListeningEndpoint(const RdmaAdapter& in_adapter)
-        : _fabric{in_adapter._fabric}
+    explicit rdma_listening_endpoint(const rdma_adapter& adapter) :
+        fabric_{adapter.fabric_}
     {
-        assert(in_adapter._fabricInfo->ep_attr->type == FI_EP_MSG);
+        assert(adapter.fabric_info_->ep_attr->type == FI_EP_MSG);
 
-        int res = fi_passive_ep(_fabric.get(), in_adapter._fabricInfo.get(), makeOutPointer(_passiveEndpoint), nullptr);
+        int res = fi_passive_ep(fabric_.get(),
+                                adapter.fabric_info_.get(),
+                                make_out_pointer(passive_endpoint_),
+                                nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_passive_ep", res};
         }
 
         fi_eq_attr eq_attr = {};
-        eq_attr.wait_obj = FI_WAIT_UNSPEC;
-        eq_attr.flags = FI_WRITE; // We'll insert custom events into EQ
-        res = fi_eq_open(_fabric.get(), &eq_attr, makeOutPointer(_eventQueue), nullptr);
+        eq_attr.wait_obj   = FI_WAIT_UNSPEC;
+        eq_attr.flags      = FI_WRITE; // We'll insert custom events into EQ
+        res = fi_eq_open(fabric_.get(), &eq_attr, make_out_pointer(event_queue_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_eq_open", res};
         }
 
-        res = fi_pep_bind(_passiveEndpoint.get(), toFid(_eventQueue), 0);
+        res = fi_pep_bind(passive_endpoint_.get(), to_fid(event_queue_), 0);
         if (res != 0)
         {
             throw rdma_error{"fi_pep_bind", res};
         }
 
-        res = fi_listen(_passiveEndpoint.get());
+        res = fi_listen(passive_endpoint_.get());
         if (res != 0)
         {
             throw rdma_error{"fi_listen", res};
         }
     }
 
-    size_t getMaxConnectionDataSize() const
+    size_t max_connection_data_size() const
     {
-        size_t maxConnectionDataSize = 0;
-        size_t maxConnectionDataSizeLength = sizeof(maxConnectionDataSize);
-        int res = fi_getopt(toFid(_passiveEndpoint), FI_OPT_ENDPOINT,
-                            FI_OPT_CM_DATA_SIZE, &maxConnectionDataSize, &maxConnectionDataSizeLength);
+        size_t value        = 0;
+        size_t value_length = sizeof(value);
+        int    res          = fi_getopt(
+            to_fid(passive_endpoint_), FI_OPT_ENDPOINT, FI_OPT_CM_DATA_SIZE, &value, &value_length);
         if (res != 0)
         {
             throw rdma_error{"fi_getopt", res};
         }
-        return maxConnectionDataSize;
+        return value;
     }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct EfaFabric
+struct efa_fabric
 {
-    std::shared_ptr<fi_info>    _fabricInfo;
-    std::shared_ptr<fid_fabric> _fabric;
+    std::shared_ptr<fi_info>    fabric_info_;
+    std::shared_ptr<fid_fabric> fabric_;
 
-    explicit EfaFabric(std::shared_ptr<fi_info> in_fabricInfo)
-        : _fabricInfo{std::move(in_fabricInfo)}
+    explicit efa_fabric(std::shared_ptr<fi_info> fabric_info) :
+        fabric_info_{std::move(fabric_info)}
     {
-        int res = fi_fabric(_fabricInfo->fabric_attr, makeOutPointer(_fabric), nullptr);
+        int res = fi_fabric(fabric_info_->fabric_attr, make_out_pointer(fabric_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_fabric", res};
         }
-
-
     }
 };
 
-class EfaCompletionCallback
+class efa_completion_callback
 {
 public:
-    virtual void onCompletion(uint64_t flags, size_t length) noexcept = 0;
+    virtual void on_completion(uint64_t flags, size_t length) noexcept = 0;
 
 protected:
-    ~EfaCompletionCallback() {}
+    ~efa_completion_callback() {}
 };
 
-class EfaProgressable : public EfaCompletionCallback
+class efa_progressable : public efa_completion_callback
 {
 public:
-    virtual ~EfaProgressable() {}
-    virtual void onError(int errorCode) noexcept = 0;
-    virtual fid_cq& getCompletionQueue() const = 0;
+    virtual ~efa_progressable() {}
+
+    virtual void    on_error(int errorCode) noexcept = 0;
+    virtual fid_cq& completion_queue() const         = 0;
 };
 
-class EfaExecutionContext final
+class efa_execution_context final
 {
 public:
-    static constexpr uint32_t MAX_COMPLETION_ENTRY_PROGRESS = 4;
+    static constexpr uint32_t max_completion_entry_progress = 4;
 
-    EfaExecutionContext() :
-        _stopped{false},
-        _workThread{&EfaExecutionContext::threadFunc, this}
+    efa_execution_context() :
+        stopped_{false},
+        work_thread_{&efa_execution_context::thread_func, this}
     {
     }
 
-    EfaExecutionContext(const EfaExecutionContext&)            = delete;
-    EfaExecutionContext& operator=(const EfaExecutionContext&) = delete;
+    efa_execution_context(const efa_execution_context&)            = delete;
+    efa_execution_context& operator=(const efa_execution_context&) = delete;
 
-    ~EfaExecutionContext()
+    ~efa_execution_context()
     {
         {
-            std::lock_guard lock{_mtx};
-            _stopped = true;
+            std::lock_guard lock{mtx_};
+            stopped_ = true;
         }
-        _condVar.notify_one();
+        cond_var_.notify_one();
 
-        if (_workThread.joinable())
+        if (work_thread_.joinable())
         {
-            _workThread.join();
+            work_thread_.join();
         }
     }
 
-    void postWork(const std::shared_ptr<EfaProgressable>& progressable, uint32_t count = 1)
+    void post_work(const std::shared_ptr<efa_progressable>& progressable, uint32_t count = 1)
     {
-        const bool needNotification = [&] {
-            std::lock_guard lock{_mtx};
-            const auto      it = findProgressableContext(progressable);
-            if (it == _progressables.end())
+        const bool need_notification = [&] {
+            std::lock_guard lock{mtx_};
+            const auto      it = find_progressable_context(progressable);
+            if (it == progressables_.end())
             {
                 return false;
             }
-            const auto prevOutstandingWork = it->_pendingOps;
-            it->_pendingOps += count;
-            return prevOutstandingWork == 0;
+            const auto prev_outstanding_work = it->pending_ops_;
+            it->pending_ops_ += count;
+            return prev_outstanding_work == 0;
         }();
 
-        if (needNotification)
+        if (need_notification)
         {
-            _condVar.notify_one();
+            cond_var_.notify_one();
         }
     }
 
-    void addProgressable(std::shared_ptr<EfaProgressable> progressable)
+    void add_progressable(std::shared_ptr<efa_progressable> progressable)
     {
-        std::lock_guard lock{_mtx};
-        const auto it = findProgressableContext(progressable);
-        if (it != _progressables.end())
+        std::lock_guard lock{mtx_};
+        const auto      it = find_progressable_context(progressable);
+        if (it != progressables_.end())
         {
             // Already added
             return;
         }
-        _progressables.emplace_back(std::move(progressable));
+        progressables_.emplace_back(std::move(progressable));
     }
 
-    void removeProgressable(const std::shared_ptr<EfaProgressable>& progressable)
+    void remove_progressable(const std::shared_ptr<efa_progressable>& progressable)
     {
-        std::lock_guard lock{_mtx};
-        const auto it = findProgressableContext(progressable);
-        if (it != _progressables.end())
+        std::lock_guard lock{mtx_};
+        const auto      it = find_progressable_context(progressable);
+        if (it != progressables_.end())
         {
-            _progressables.erase(it);
+            progressables_.erase(it);
         }
     }
 
-    size_t getNumProgressables() const
+    size_t num_progressables() const
     {
-        std::lock_guard lock{_mtx};
-        return _progressables.size();
+        std::lock_guard lock{mtx_};
+        return progressables_.size();
     }
 
 private:
     uint32_t getNumPendingOps() const
     {
         uint32_t total = 0;
-        for (const auto& ep : _progressables)
+        for (const auto& ep : progressables_)
         {
-            total += ep._pendingOps;
+            total += ep.pending_ops_;
         }
         return total;
     }
 
-    void threadFunc()
+    void thread_func()
     {
-        fi_cq_msg_entry entry[MAX_COMPLETION_ENTRY_PROGRESS] = {};
+        fi_cq_msg_entry entry[max_completion_entry_progress] = {};
         while (true)
         {
-            std::unique_lock lock{_mtx};
-            _condVar.wait(lock, [this] { return getNumPendingOps() > 0 || _stopped; });
-            if (_stopped)
+            std::unique_lock lock{mtx_};
+            cond_var_.wait(lock, [this] { return getNumPendingOps() > 0 || stopped_; });
+            if (stopped_)
             {
                 return;
             }
 
-            for (auto& progressableCtx : _progressables)
+            for (auto& ctx : progressables_)
             {
-                if (progressableCtx._pendingOps == 0)
+                if (ctx.pending_ops_ == 0)
                 {
                     continue;
                 }
                 const ssize_t n = fi_cq_read(
-                    &progressableCtx._progressable->getCompletionQueue(), &entry, MAX_COMPLETION_ENTRY_PROGRESS);
+                    &ctx.progressable_->completion_queue(), &entry, max_completion_entry_progress);
                 if (n > 0)
                 {
-                    progressableCtx._pendingOps -= n;
+                    ctx.pending_ops_ -= n;
 
                     for (int i = 0; i < n; ++i)
                     {
                         if (!entry[i].op_context)
                         {
                             // Use a default completion callback
-                            progressableCtx._progressable->onCompletion(entry[i].flags, entry[i].len);
+                            ctx.progressable_->on_completion(entry[i].flags, entry[i].len);
                         }
                         else
                         {
                             // If the op_context is set, it means that the operation was posted
                             // with a custom context, so we can use it to identify the operation.
-                            // Otherwise, we just call onCompletion with flags and length.
-                            auto* ctx = static_cast<EfaCompletionCallback*>(entry[i].op_context);
-                            ctx->onCompletion(entry[i].flags, entry[i].len);
+                            // Otherwise, we just call on_completion with flags and length.
+                            auto* ctx = static_cast<efa_completion_callback*>(entry[i].op_context);
+                            ctx->on_completion(entry[i].flags, entry[i].len);
                         }
                     }
                 }
                 else if (n != -FI_EAGAIN && n != -FI_EINTR)
                 {
                     fi_cq_err_entry errEntry{};
-                    const auto      ret = fi_cq_readerr(
-                        &progressableCtx._progressable->getCompletionQueue(), &errEntry, 0);
+                    const auto      ret =
+                        fi_cq_readerr(&ctx.progressable_->completion_queue(), &errEntry, 0);
                     if (ret < 0)
                     {
                         // Could happen if there's another progress engine, polling the same CQ
@@ -678,8 +688,8 @@ private:
                         assert(ret == -FI_EAGAIN);
                     }
 
-                    progressableCtx._pendingOps -= 1;
-                    progressableCtx._progressable->onError(errEntry.err);
+                    ctx.pending_ops_ -= 1;
+                    ctx.progressable_->on_error(errEntry.err);
                 }
             }
         }
@@ -688,101 +698,111 @@ private:
 private:
     struct ProgressableContext
     {
-        ProgressableContext(std::shared_ptr<EfaProgressable> progressable)
-            : _progressable{std::move(progressable)}
-            , _pendingOps{0}
+        ProgressableContext(std::shared_ptr<efa_progressable> progressable) :
+            progressable_{std::move(progressable)},
+            pending_ops_{0}
         {
         }
 
-        std::shared_ptr<EfaProgressable> _progressable;
-        uint32_t _pendingOps;
+        std::shared_ptr<efa_progressable> progressable_;
+        uint32_t                          pending_ops_;
     };
 
     std::vector<ProgressableContext>::iterator
-    findProgressableContext(const std::shared_ptr<EfaProgressable>& progressable)
+    find_progressable_context(const std::shared_ptr<efa_progressable>& progressable)
     {
-        return std::find_if(_progressables.begin(), _progressables.end(), [&](const ProgressableContext& ep) {
-            return ep._progressable == progressable;
-        });
+        return std::find_if(
+            progressables_.begin(), progressables_.end(), [&](const ProgressableContext& ep) {
+                return ep.progressable_ == progressable;
+            });
     }
 
-    mutable std::mutex _mtx;
-    std::condition_variable _condVar;
-    std::vector<ProgressableContext> _progressables;
+    mutable std::mutex               mtx_;
+    std::condition_variable          cond_var_;
+    std::vector<ProgressableContext> progressables_;
 
-    bool _stopped;
-    std::thread _workThread;
+    bool        stopped_;
+    std::thread work_thread_;
 };
 
-struct EfaDomain
+struct efa_domain
 {
-    std::shared_ptr<EfaFabric> _fabric;
-    std::unique_ptr<fid_domain> _domain;
-    std::unique_ptr<EfaExecutionContext> _executionCtx;
+    std::shared_ptr<efa_fabric>            fabric_;
+    std::unique_ptr<fid_domain>            domain_;
+    std::unique_ptr<efa_execution_context> execution_ctx_;
+    std::atomic<std::uint32_t>             next_mr_key = 1;
 
-    explicit EfaDomain(std::shared_ptr<EfaFabric> in_fabric)
-        : _fabric{std::move(in_fabric)}
+    explicit efa_domain(std::shared_ptr<efa_fabric> in_fabric) :
+        fabric_{std::move(in_fabric)}
     {
-        int res = fi_domain(_fabric->_fabric.get(), _fabric->_fabricInfo.get(), makeOutPointer(_domain), nullptr);
+        const int res = fi_domain(fabric_->fabric_.get(),
+                                  fabric_->fabric_info_.get(),
+                                  make_out_pointer(domain_),
+                                  nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_domain", res};
         }
 
-        _executionCtx = std::make_unique<EfaExecutionContext>();
+        execution_ctx_ = std::make_unique<efa_execution_context>();
     }
 };
 
-struct EfaEndpoint
+struct efa_endpoint
 {
-    std::shared_ptr<EfaDomain> _domain;
+    std::shared_ptr<efa_domain> domain_;
 
-    std::unique_ptr<fid_cq>    _completionQueue;
-    std::unique_ptr<fid_av>    _addressVector;
-    std::unique_ptr<fid_ep>    _endpoint; // must be destroyed before anything that binds to it (so EQ, CQ and CNTR)
+    std::unique_ptr<fid_cq> completion_queue_;
+    std::unique_ptr<fid_av> address_vector_;
+    std::unique_ptr<fid_ep> endpoint_;
 
-    EfaEndpoint(std::shared_ptr<EfaDomain> in_domain)
-        : _domain{std::move(in_domain)}
+    explicit efa_endpoint(std::shared_ptr<efa_domain> domain) :
+        domain_{std::move(domain)}
     {
-        assert(_domain->_fabric->_fabricInfo->ep_attr->type == FI_EP_RDM);
+        assert(domain_->fabric_->fabric_info_->ep_attr->type == FI_EP_RDM);
 
-        int res = fi_endpoint(_domain->_domain.get(), _domain->_fabric->_fabricInfo.get(), makeOutPointer(_endpoint), nullptr);
+        int res = fi_endpoint(domain_->domain_.get(),
+                              domain_->fabric_->fabric_info_.get(),
+                              make_out_pointer(endpoint_),
+                              nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_endpoint", res};
         }
 
         fi_av_attr avAttrs = {};
-        avAttrs.type = _domain->_fabric->_fabricInfo->domain_attr->av_type;
-        avAttrs.count = 1;
-        res = fi_av_open(_domain->_domain.get(), &avAttrs, makeOutPointer(_addressVector), nullptr);
+        avAttrs.type       = domain_->fabric_->fabric_info_->domain_attr->av_type;
+        avAttrs.count      = 1;
+        res =
+            fi_av_open(domain_->domain_.get(), &avAttrs, make_out_pointer(address_vector_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_av_open", res};
         }
 
-        fi_cq_attr cqAttrs = {};
-        cqAttrs.size = _domain->_fabric->_fabricInfo->tx_attr->size; // We can limit it later, for now use the full capability
-        cqAttrs.wait_obj = FI_WAIT_NONE;
-        cqAttrs.format = FI_CQ_FORMAT_MSG;
-        res = fi_cq_open(_domain->_domain.get(), &cqAttrs, makeOutPointer(_completionQueue), nullptr);
+        fi_cq_attr cq_attrs = {};
+        cq_attrs.size       = domain_->fabric_->fabric_info_->tx_attr->size;
+        cq_attrs.wait_obj   = FI_WAIT_NONE;
+        cq_attrs.format     = FI_CQ_FORMAT_MSG;
+        res                 = fi_cq_open(
+            domain_->domain_.get(), &cq_attrs, make_out_pointer(completion_queue_), nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_cq_open", res};
         }
 
-        res = fi_ep_bind(_endpoint.get(), toFid(_completionQueue), FI_RECV | FI_SEND);
+        res = fi_ep_bind(endpoint_.get(), to_fid(completion_queue_), FI_RECV | FI_SEND);
         if (res != 0)
         {
             throw rdma_error{"fi_ep_bind to CQ", res};
         }
-        res = fi_ep_bind(_endpoint.get(), toFid(_addressVector), 0);
+        res = fi_ep_bind(endpoint_.get(), to_fid(address_vector_), 0);
         if (res != 0)
         {
             throw rdma_error{"fi_ep_bind to AV", res};
         }
         // We want to post receive before accepting a connection.
-        res = fi_enable(_endpoint.get());
+        res = fi_enable(endpoint_.get());
         if (res != 0)
         {
             throw rdma_error{"fi_enable", res};
@@ -793,79 +813,86 @@ struct EfaEndpoint
 // Definition from libfabric sources: prov/efa/src/rdm/efa_rdm_protocol.h
 struct efa_ep_addr
 {
-    std::uint8_t raw[16];
+    std::uint8_t  raw[16];
     std::uint16_t qpn;
     std::uint16_t pad;
     std::uint32_t qkey;
 };
 
-inline bool parseFabricAddress(const std::string& in_address, std::uint32_t in_addrFormat, void* out_addrBuffer, size_t in_addrLength)
+inline bool parse_fabric_address(const std::string& address,
+                                 std::uint32_t      addr_format,
+                                 void*              addr_buffer,
+                                 size_t             addr_length)
 {
-    if (in_addrFormat == FI_SOCKADDR_IN)
+    if (addr_format == FI_SOCKADDR_IN)
     {
-        if (in_addrLength < sizeof(sockaddr_in))
+        if (addr_length < sizeof(sockaddr_in))
         {
             return false; // Buffer too small
         }
-        sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(out_addrBuffer);
+        sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(addr_buffer);
         memset(addr, 0, sizeof(sockaddr_in));
         addr->sin_family = AF_INET;
-        if (inet_pton(AF_INET, in_address.c_str(), &addr->sin_addr) != 1)
+        if (inet_pton(AF_INET, address.c_str(), &addr->sin_addr) != 1)
         {
             return false;
         }
         addr->sin_port = htons(0); // Port is not specified
     }
-    else if (in_addrFormat == FI_SOCKADDR_IN6)
+    else if (addr_format == FI_SOCKADDR_IN6)
     {
-        if (in_addrLength < sizeof(sockaddr_in6))
+        if (addr_length < sizeof(sockaddr_in6))
         {
             return false; // Buffer too small
         }
-        sockaddr_in6* addr = reinterpret_cast<sockaddr_in6*>(out_addrBuffer);
+        sockaddr_in6* addr = reinterpret_cast<sockaddr_in6*>(addr_buffer);
         memset(addr, 0, sizeof(sockaddr_in6));
         addr->sin6_family = AF_INET6;
-        if (inet_pton(AF_INET6, in_address.c_str(), &addr->sin6_addr) != 1)
+        if (inet_pton(AF_INET6, address.c_str(), &addr->sin6_addr) != 1)
         {
             return false;
         }
         addr->sin6_port = htons(0); // Port is not specified
     }
-    else if (in_addrFormat == FI_ADDR_EFA)
+    else if (addr_format == FI_ADDR_EFA)
     {
-        if ( in_addrLength < sizeof(efa_ep_addr) )
+        if (addr_length < sizeof(efa_ep_addr))
         {
             return false; // Not enough space for EFA address
         }
-        if ( in_address.rfind( "efa://[", 0 ) != 0 )
+        if (address.rfind("efa://[", 0) != 0)
         {
             return false;
         }
-        const auto endPos = in_address.find( L']', 7 );
-        if ( endPos == std::string::npos )
+        const auto end_pos = address.find(L']', 7);
+        if (end_pos == std::string::npos)
         {
             return false; // Missing closing bracket
         }
-        efa_ep_addr* efaAddr = reinterpret_cast<efa_ep_addr*>(out_addrBuffer);
-        const auto ipv6Address = in_address.substr(7, endPos - 7);
-        if (!inet_pton( AF_INET6, ipv6Address.c_str(), efaAddr->raw ))
+        efa_ep_addr* efa_addr     = reinterpret_cast<efa_ep_addr*>(addr_buffer);
+        const auto   ipv6_address = address.substr(7, end_pos - 7);
+        if (!inet_pton(AF_INET6, ipv6_address.c_str(), efa_addr->raw))
         {
             return false; // Invalid IPv6 address
         }
 #ifndef _WIN32
-        if ( std::sscanf(in_address.substr(endPos + 1).c_str(), ":%hu:%u", &efaAddr->qpn, &efaAddr->qkey) != 2 )
+        if (std::sscanf(
+                address.substr(end_pos + 1).c_str(), ":%hu:%u", &efa_addr->qpn, &efa_addr->qkey) !=
+            2)
 #else
-        if ( sscanf_s(in_address.substr(endPos + 1).c_str(), ":%hu:%u", &efaAddr->qpn, &efaAddr->qkey) != 2 )
+        if (sscanf_s(
+                address.substr(end_pos + 1).c_str(), ":%hu:%u", &efa_addr->qpn, &efa_addr->qkey) !=
+            2)
 #endif
         {
             return false; // Invalid format for qpn and qkey
         }
         return true;
     }
-    else if (in_addrFormat == FI_ADDR_STR)
+    else if (addr_format == FI_ADDR_STR)
     {
-        strncpy(reinterpret_cast<char*>(out_addrBuffer), in_address.c_str(), in_addrLength - 1);
-        reinterpret_cast<char*>(out_addrBuffer)[in_addrLength - 1] = '\0'; // Ensure null-termination
+        strncpy(reinterpret_cast<char*>(addr_buffer), address.c_str(), addr_length - 1);
+        reinterpret_cast<char*>(addr_buffer)[addr_length - 1] = '\0'; // Ensure null-termination
     }
     else
     {
@@ -875,49 +902,49 @@ inline bool parseFabricAddress(const std::string& in_address, std::uint32_t in_a
     return true;
 }
 
-inline std::string getAddressAsString(const void* in_addr, uint32_t in_addrFormat)
+inline std::string get_address_as_string(const void* addr, uint32_t addr_format)
 {
-    switch (in_addrFormat)
+    switch (addr_format)
     {
     case FI_SOCKADDR_IN:
     {
-        const sockaddr_in* addr = reinterpret_cast<const sockaddr_in*>(in_addr);
-        char buf[INET_ADDRSTRLEN + 1];
-        inet_ntop(AF_INET, &addr->sin_addr, buf, INET_ADDRSTRLEN);
+        const sockaddr_in* sockaddr = reinterpret_cast<const sockaddr_in*>(addr);
+        char               buf[INET_ADDRSTRLEN + 1];
+        inet_ntop(AF_INET, &sockaddr->sin_addr, buf, INET_ADDRSTRLEN);
         return std::string(buf);
     }
     case FI_SOCKADDR_IN6:
     {
-        const sockaddr_in6* addr = reinterpret_cast<const sockaddr_in6*>(in_addr);
-        char buf[INET6_ADDRSTRLEN + 1];
-        inet_ntop(AF_INET6, &addr->sin6_addr, buf, INET6_ADDRSTRLEN);
+        const sockaddr_in6* sockaddr = reinterpret_cast<const sockaddr_in6*>(addr);
+        char                buf[INET6_ADDRSTRLEN + 1];
+        inet_ntop(AF_INET6, &sockaddr->sin6_addr, buf, INET6_ADDRSTRLEN);
         return std::string(buf);
     }
     case FI_ADDR_EFA:
     {
-        // EFA 'sock' address is an IPv6 (128 bits for address and 16-bits for port) with an additional 32-bit qkey
-        // EFA addresses are not supposed to be human-readable but we need to tell return something stringy on /status request
+        // EFA 'sock' address is an IPv6 (128 bits for address and 16-bits for port) with an
+        // additional 32-bit qkey EFA addresses are not supposed to be human-readable but we need to
+        // tell return something stringy on /status request
 
         char buf[INET6_ADDRSTRLEN + 1];
-        if (!inet_ntop(AF_INET6, in_addr, buf, INET6_ADDRSTRLEN))
+        if (!inet_ntop(AF_INET6, addr, buf, INET6_ADDRSTRLEN))
         {
             throw std::runtime_error("Error calling inet_ntop");
         }
-        const efa_ep_addr* efa_addr = reinterpret_cast<const efa_ep_addr*>(in_addr);
-        std::stringstream ss;
+        const efa_ep_addr* efa_addr = reinterpret_cast<const efa_ep_addr*>(addr);
+        std::stringstream  ss;
         ss << "efa://[" << buf << "]:" << efa_addr->qpn << ':' << efa_addr->qkey;
         return ss.str();
     }
     case FI_ADDR_STR: // Address as a null-terminated string
-        return std::string{reinterpret_cast<const char*>(in_addr)};
-    case FI_SOCKADDR_IB:
-        throw std::runtime_error("Unsupported IB address format");
+        return std::string{reinterpret_cast<const char*>(addr)};
+    case FI_SOCKADDR_IB: throw std::runtime_error("Unsupported IB address format");
     }
 
     throw std::runtime_error("Unsupported address format");
 }
 
-inline std::string getFabricLocalAddressAsString(const fi_info& in_info)
+inline std::string get_fabric_local_address_as_string(const fi_info& info)
 {
-    return getAddressAsString(in_info.src_addr, in_info.addr_format);
+    return get_address_as_string(info.src_addr, info.addr_format);
 }

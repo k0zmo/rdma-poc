@@ -1,6 +1,6 @@
-#include "rdma_types.h"
-#include "rdma_defs.h"
 #include "getopt.h"
+#include "rdma_defs.h"
+#include "rdma_types.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -48,346 +48,357 @@
 #include <utility>
 #include <vector>
 
-struct AppOptions
+struct app_options
 {
-//    std::string _address{""};
-    std::uint16_t _port{16002};
-    std::string _providerName{""};
-//    std::string _flowId{};
-    std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
-    int _numDomains{1};
-    int _intervalMs{20}; // 50p
-    bool _verbose{false};
+    std::uint16_t port{16002};
+    std::string   provider_name{""};
+    std::uint32_t frame_size{1920 * 1080 * 8 / 3};
+    int           num_domains{1};
+    int           interval_ms{20};
+    bool          verbose{false};
 };
 
-static std::string getAddressAsString(fid_av& av, const void* addr)
+static std::string get_address_as_string(fid_av& av, const void* addr)
 {
-    char buf[128]{};
-    size_t len = sizeof(buf);
+    char        buf[128]{};
+    size_t      len = sizeof(buf);
     const char* res = fi_av_straddr(&av, addr, buf, &len);
     return res ? std::string{buf, len} : std::string{};
 }
 
 template <typename T>
-size_t copyFromBuffer(asio::const_buffer& inout_buf, T& in_value)
+size_t copy_from_buffer(asio::const_buffer& buf, T& value)
 {
-    static_assert(std::is_trivially_copy_assignable_v<T>, "");
-    std::memcpy(&in_value, inout_buf.data(), sizeof(T));
-    inout_buf += sizeof(T);
+    static_assert(std::is_trivially_copy_assignable_v<T>);
+    std::memcpy(&value, buf.data(), sizeof(T));
+    buf += sizeof(T);
     return sizeof(T);
 }
 
 template <typename T>
 std::shared_ptr<std::vector<uint8_t>>
-serializeControlMessage( const EfaControlMessageHeader& in_header, const T& in_message )
+serialize_control_message(const efa::control_message_header& header, const T& message)
 {
-    static_assert( std::is_trivially_copy_assignable_v<T> );
-    const auto size = sizeof(in_header) + sizeof(in_message);
-    auto buf = std::make_shared<std::vector<uint8_t>>(size);
-    memcpy( buf->data(), &in_header, sizeof(in_header) );
-    memcpy( buf->data() + sizeof(in_header), &in_message, sizeof(in_message) );
+    static_assert(std::is_trivially_copy_assignable_v<T>);
+    const auto size = sizeof(header) + sizeof(message);
+    auto       buf  = std::make_shared<std::vector<uint8_t>>(size);
+    memcpy(buf->data(), &header, sizeof(header));
+    memcpy(buf->data() + sizeof(header), &message, sizeof(message));
     return buf;
 }
 
-/**
- * View MemoryBuffer as boost::asio::const_buffers_1 object.
- *
- * \param in_buf [in] Memory buffer view as const buffer
- * \return Boost ASIO const buffer
- */
-asio::const_buffers_1 getAsBuffer( const std::vector<uint8_t>& in_buf )
+asio::const_buffers_1 get_as_buffer(const std::vector<uint8_t>& buf)
 {
-    return asio::buffer( in_buf.data(), in_buf.size() );
+    return asio::buffer(buf.data(), buf.size());
 }
 
-class Peer : public std::enable_shared_from_this<Peer>
+class peer final : public std::enable_shared_from_this<peer>
 {
-    /// This is the maximum size of the message buffer that we will use to read messages from the socket.
-    static constexpr size_t MAX_MESSAGE_BUFFER_SIZE = 64 * 1024;
+    static constexpr size_t max_message_buffer_size = 64 * 1024;
 
 public:
-    Peer(asio::io_context&          ctx,
-         asio::ip::tcp::socket      socket,
-         std::shared_ptr<EfaDomain> domain,
-         AppOptions                 options) :
-        _ctx{ctx},
-        _socket{std::move(socket)},
-        _options{std::move(options)},
-        _domain{std::move(domain)}
+    peer(asio::io_context&           ctx,
+         asio::ip::tcp::socket       socket,
+         std::shared_ptr<efa_domain> domain,
+         app_options                 options) :
+        ctx_{ctx},
+        socket_{std::move(socket)},
+        options_{std::move(options)},
+        domain_{std::move(domain)}
     {
     }
 
-    ~Peer()
+    ~peer()
     {
-        _stopped = true;
-        if (_sendingThread.joinable())
-            _sendingThread.join();
+        stopped_ = true;
+        if (sending_thread_.joinable())
+        {
+            sending_thread_.join();
+        }
     }
 
     void start()
     {
-        asio::async_read(_socket,
-                         _dynamicBuf.prepare(1024),
-                         asio::transfer_at_least(sizeof(EfaControlMessageHeader) + sizeof(EfaClientConnectV1)),
-                         [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
-                             self->onClientRequestReceived(errorCode, bytesXfer);
+        asio::async_read(socket_,
+                         dynamic_buf_.prepare(1024),
+                         asio::transfer_at_least(sizeof(efa::control_message_header) +
+                                                 sizeof(efa::client_connect_v1)),
+                         [self = shared_from_this()](const auto& error_code, size_t bytes_xfer) {
+                             self->on_client_request_received(error_code, bytes_xfer);
                          });
     }
 
     void stop()
     {
-        _stopped = true;
-        _socket.cancel();
-        _completionQueue.enqueue({0xDEAD, 0, 0});
-        if (_sendingThread.joinable())
-            _sendingThread.join();
+        stopped_ = true;
+        socket_.cancel();
+        completion_queue_.enqueue({0xDEAD, 0, 0});
+        if (sending_thread_.joinable())
+        {
+            sending_thread_.join();
+        }
     }
 
 private:
-    void rejectConnection(const std::string& message)
+    void reject_connection(const std::string& message)
     {
-        EfaServerRejectV1 rejectMessage;
-        EfaControlMessageHeader header;
-        if (message.size() > sizeof(rejectMessage._errorMessage) - 1)
+        efa::server_reject_v1       reject_message;
+        efa::control_message_header header;
+        header.type   = efa::control_message_type::SERVER_REJECT_V1;
+        header.length = sizeof(reject_message);
+
+        if (message.size() > sizeof(reject_message.error_message) - 1)
         {
-            std::string truncatedMessage{message};
-            truncatedMessage.resize(sizeof(rejectMessage._errorMessage) - 1);
-            strncpy(rejectMessage._errorMessage,
-                    truncatedMessage.c_str(),
-                    truncatedMessage.size());
+            std::string truncated_message{message};
+            truncated_message.resize(sizeof(reject_message.error_message) - 1);
+            strncpy(
+                reject_message.error_message, truncated_message.c_str(), truncated_message.size());
         }
         else
         {
-            strncpy(rejectMessage._errorMessage, message.c_str(), message.size());
+            strncpy(reject_message.error_message, message.c_str(), message.size());
         }
-        header._type   = EfaControlMessageType::SERVER_REJECT_V1;
-        header._length = sizeof(rejectMessage);
 
-        auto sendBuffer = serializeControlMessage(header, rejectMessage);
-        const auto asioBuf = getAsBuffer(*sendBuffer);
+        auto       send_buffer = serialize_control_message(header, reject_message);
+        const auto asio_buf    = get_as_buffer(*send_buffer);
 
-        asio::async_write(_socket,
-                          asioBuf,
-                          [self = shared_from_this(), sendBuffer = std::move(sendBuffer)](const std::error_code&, size_t) {
-                              return; // Let the connection die on its own
-                          });
+        asio::async_write(socket_,
+                          asio_buf,
+                          [self = shared_from_this(), send_buffer = std::move(send_buffer)](
+                              const std::error_code&, size_t) { return; });
     }
 
-    void acceptConnection()
+    void accept_connection()
     {
-        EfaServerAcceptV1 acceptMessage;
-        EfaControlMessageHeader header;
-        header._type   = EfaControlMessageType::SERVER_ACCEPT_V1;
-        header._length = sizeof(acceptMessage);
-        acceptMessage._acceptConnectionTime = 1111111;
-        acceptMessage._frameSize            = _options._frameSize;
-        acceptMessage._frameMetadataSize    = 0;
-        acceptMessage._hasActiveProducers   = true;
+        efa::server_accept_v1       accept_message;
+        efa::control_message_header header;
+        header.type                           = efa::control_message_type::SERVER_ACCEPT_V1;
+        header.length                         = sizeof(accept_message);
+        accept_message.accept_connection_time = 1111111;
+        accept_message.frame_size             = options_.frame_size;
+        accept_message.frame_metadata_size    = 0;
+        accept_message.has_active_producers   = true;
 
-        auto sendBuffer = serializeControlMessage(header, acceptMessage);
-        const auto asioBuf = getAsBuffer(*sendBuffer);
+        auto       send_buffer = serialize_control_message(header, accept_message);
+        const auto asio_buf    = get_as_buffer(*send_buffer);
 
-        asio::async_write(_socket,
-                          asioBuf,
+        asio::async_write(socket_,
+                          asio_buf,
                           [self = shared_from_this(),
-                           buf  = std::move(sendBuffer)](const std::error_code&, size_t) {
-                          });
+                           buf  = std::move(send_buffer)](const std::error_code&, size_t) {});
     }
 
-    bool handleClientConnect(size_t messageSize, asio::const_buffer payloadBuf)
+    bool handle_client_connect(size_t message_size, asio::const_buffer payload_buf)
     {
-        if (_accepted) // We've already process connect request
+        if (accepted_)
         {
-            rejectConnection("EfaClientConnectV1 message already handled");
+            reject_connection("client_connect_v1 message already handled");
             stop();
             return false;
         }
 
-        if (messageSize != sizeof(EfaClientConnectV1))
+        if (message_size != sizeof(efa::client_connect_v1))
         {
-            rejectConnection("EfaClientConnectV1 message size differs");
+            reject_connection("client_connect_v1 message size differs");
             return false;
         }
 
-        EfaClientConnectV1 clientConnect;
-        const auto consumed = copyFromBuffer(payloadBuf, /*inout*/clientConnect);
-        _dynamicBuf.consume(consumed);
+        efa::client_connect_v1 client_connect;
+        const auto             consumed = copy_from_buffer(payload_buf, client_connect);
+        dynamic_buf_.consume(consumed);
 
-        if (clientConnect._addressFormat != _domain->_fabric->_fabricInfo->addr_format)
-        {
-            std::stringstream ss;
-            ss << "Invalid address format, must be " << (uint32_t)_domain->_fabric->_fabricInfo->addr_format;
-            rejectConnection(ss.str());
-            return false;
-        }
-        if (clientConnect._addressLength > sizeof(clientConnect._destAddressBytes))
+        if (client_connect.address_format != domain_->fabric_->fabric_info_->addr_format)
         {
             std::stringstream ss;
-            ss << "Invalid address length, can't be greater than " << sizeof(clientConnect._destAddressBytes);
-            rejectConnection(ss.str());
+            ss << "Invalid address format, must be "
+               << (uint32_t)domain_->fabric_->fabric_info_->addr_format;
+            reject_connection(ss.str());
+            return false;
+        }
+        if (client_connect.address_length > sizeof(client_connect.dest_address_bytes))
+        {
+            std::stringstream ss;
+            ss << "Invalid address length, can't be greater than "
+               << sizeof(client_connect.dest_address_bytes);
+            reject_connection(ss.str());
             return false;
         }
 
-        acceptConnection();
+        accept_connection();
 
-        _sendingThread = std::thread{[self = shared_from_this(), clientConnect]() mutable {
+        sending_thread_ = std::thread{[self = shared_from_this(), client_connect]() mutable {
             try
             {
-                self->createEfaEndpoint(clientConnect);
-                self->createData();
-                self->sendLoop();
+                self->create_efa_endpoint(client_connect);
+                self->create_data();
+                self->send_loop();
 
-                auto& ctx = self->_ctx; // self is moved before we can pass self->_ctx
+                auto& ctx = self->ctx_;
                 asio::post(ctx, [self = std::move(self)]() { self->stop(); });
             }
             catch (const std::exception& ex)
             {
-                DEBUG_LOG("EXCEPTION: %s", ex.what());
-                auto& ctx = self->_ctx;
+                LOG_DEBUG("EXCEPTION: %s", ex.what());
+                auto& ctx = self->ctx_;
                 asio::post(ctx, [self = std::move(self)]() { self->stop(); });
                 return;
             }
         }};
 
-        return messageSize;
+        return message_size;
     }
 
-    bool handleClientShutdown(size_t messageSize, asio::const_buffer payloadBuf)
+    bool handle_client_shutdown(size_t message_size, asio::const_buffer payload_buf)
     {
-        DEBUG_LOG("Received shutdown request");
-        (void)messageSize;
-        (void)payloadBuf;
+        LOG_DEBUG("Received shutdown request");
+        (void)message_size;
+        (void)payload_buf;
         stop();
         return false;
     }
 
-    void onClientRequestReceived(const std::error_code& errorCode, size_t bytesXfer)
+    void on_client_request_received(const std::error_code& error_code, size_t bytes_xfer)
     {
-        if (_stopped)
-            return;
-
-        if (errorCode)
+        if (stopped_)
         {
-            DEBUG_LOG("Error reading client requiest: %s", errorCode.message().c_str());
+            return;
+        }
+
+        if (error_code)
+        {
+            LOG_DEBUG("Error reading client requiest: %s", error_code.message().c_str());
             stop();
             return;
         }
 
-        assert(bytesXfer >= sizeof(EfaControlMessageHeader));
-        
-        _dynamicBuf.commit(bytesXfer);
-        asio::const_buffer buf = _dynamicBuf.data();
-        const auto numBytesInBuf = buf.size();
+        assert(bytes_xfer >= sizeof(efa::control_message_header));
 
-        // Read size and tag of the control message
-        EfaControlMessageHeader header;
-        copyFromBuffer(buf, /*inout*/header);
+        dynamic_buf_.commit(bytes_xfer);
+        asio::const_buffer buf              = dynamic_buf_.data();
+        const auto         num_bytes_in_buf = buf.size();
 
-        if (numBytesInBuf < header._length + sizeof(EfaControlMessageHeader))
+        efa::control_message_header header;
+        copy_from_buffer(buf, header);
+
+        if (num_bytes_in_buf < header.length + sizeof(efa::control_message_header))
         {
-            // Read more data from the socket. We already have `numBytesInBuf` bytes in the
-            // streambuf from the total of `header._length`. Read the remaining bytes. Because
-            // header's length is u16, we dont really need to protect ourselves from too huge values
-            // and reading 4GB of data from socket in the worst case scenario.
-            const auto bytesToRead = std::min<size_t>(
-                MAX_MESSAGE_BUFFER_SIZE,
-                header._length + sizeof( EfaControlMessageHeader ) - numBytesInBuf );
-            asio::async_read(_socket,
-                             _dynamicBuf.prepare(MAX_MESSAGE_BUFFER_SIZE),
-                             asio::transfer_at_least(bytesToRead),
-                             [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
-                                 self->onClientRequestReceived(errorCode, bytesXfer);
-                             });
+            const auto bytes_to_read = std::min<size_t>(
+                max_message_buffer_size,
+                header.length + sizeof(efa::control_message_header) - num_bytes_in_buf);
+            asio::async_read(
+                socket_,
+                dynamic_buf_.prepare(max_message_buffer_size),
+                asio::transfer_at_least(bytes_to_read),
+                [self = shared_from_this()](const auto& error_code, size_t bytes_xfer) {
+                    self->on_client_request_received(error_code, bytes_xfer);
+                });
             return;
         }
 
-        _dynamicBuf.consume(sizeof(EfaControlMessageHeader));
+        dynamic_buf_.consume(sizeof(efa::control_message_header));
 
-        // At this point the message should be complete
-        switch (header._type)
+        switch (header.type)
         {
-        case EfaControlMessageType::CLIENT_CONNECT_V1:
-            if (!handleClientConnect(header._length, buf))
+        case efa::control_message_type::CLIENT_CONNECT_V1:
+            if (!handle_client_connect(header.length, buf))
             {
-                return; // Don't read more requests
+                return;
             }
             break;
-        case EfaControlMessageType::CLIENT_SHUTDOWN_V1:
-            handleClientShutdown(header._length, buf);
+        case efa::control_message_type::CLIENT_SHUTDOWN_V1:
+            handle_client_shutdown(header.length, buf);
             break;
-        case EfaControlMessageType::SERVER_ACCEPT_V1:
-        case EfaControlMessageType::SERVER_REJECT_V1:
-            DEBUG_LOG("Invalid control message: %hu, closing connection", (uint16_t)header._type);
-            return; // Protocol fatal error
+        case efa::control_message_type::SERVER_ACCEPT_V1:
+        case efa::control_message_type::SERVER_REJECT_V1:
+            LOG_DEBUG("Invalid control message: %hu, closing connection", (uint16_t)header.type);
+            return;
         default:
-            DEBUG_LOG("Unsupported control message: %hu, skipping", (uint16_t)header._type);
+            LOG_DEBUG("Unsupported control message: %hu, skipping", (uint16_t)header.type);
             break;
         }
-        
-        asio::async_read(_socket,
-                         _dynamicBuf.prepare(MAX_MESSAGE_BUFFER_SIZE),
-                         asio::transfer_at_least(sizeof(EfaControlMessageHeader)),
-                         [self = shared_from_this()](const auto& errorCode, size_t bytesXfer) {
-                             self->onClientRequestReceived(errorCode, bytesXfer);
+
+        asio::async_read(socket_,
+                         dynamic_buf_.prepare(max_message_buffer_size),
+                         asio::transfer_at_least(sizeof(efa::control_message_header)),
+                         [self = shared_from_this()](const auto& error_code, size_t bytes_xfer) {
+                             self->on_client_request_received(error_code, bytes_xfer);
                          });
     }
 
-    void createEfaEndpoint(const EfaClientConnectV1& clientConnect)
+    void create_efa_endpoint(const efa::client_connect_v1& client_connect)
     {
-        _endpoint = std::make_shared<EfaEndpoint>(_domain);
-        _progressable = std::make_shared<Progressable>(*_endpoint->_completionQueue, _completionQueue);
+        endpoint_ = std::make_shared<efa_endpoint>(domain_);
+        progressable_ =
+            std::make_shared<progressable>(*endpoint_->completion_queue_, completion_queue_);
 
-        auto res = fi_av_insert(_endpoint->_addressVector.get(), clientConnect._destAddressBytes, 1, &_addrVector, 0U, nullptr);
-        if (res != 1) // Returns number of addresses inserted
+        auto res = fi_av_insert(endpoint_->address_vector_.get(),
+                                client_connect.dest_address_bytes,
+                                1,
+                                &addr_vector_,
+                                0U,
+                                nullptr);
+        if (res != 1)
         {
-            DEBUG_LOG("fi_av_insert: %d", res);
+            LOG_DEBUG("fi_av_insert: %d", res);
         }
 
-        const auto peerAddress = getAddressAsString(*_endpoint->_addressVector, clientConnect._destAddressBytes);
-        DEBUG_LOG("Peer address: %s", peerAddress.c_str());
+        const auto peer_address =
+            get_address_as_string(*endpoint_->address_vector_, client_connect.dest_address_bytes);
+        LOG_DEBUG("Peer address: %s", peer_address.c_str());
 
-        char addrBuf[128]{};
-        size_t addrLen = sizeof(addrBuf);
-        res = fi_getname(toFid(_endpoint->_endpoint), addrBuf, &addrLen);
+        char   addr_buf[128]{};
+        size_t addr_len = sizeof(addr_buf);
+        res             = fi_getname(to_fid(endpoint_->endpoint_), addr_buf, &addr_len);
         if (res == 0)
         {
-            const auto localAddress = getAddressAsString(*_endpoint->_addressVector, addrBuf);
-            DEBUG_LOG("Local address: %s", localAddress.c_str());            
+            const auto local_address = get_address_as_string(*endpoint_->address_vector_, addr_buf);
+            LOG_DEBUG("Local address: %s", local_address.c_str());
         }
     }
 
-    void createData()
+    void create_data()
     {
-        _message = std::make_unique<char[]>(_options._frameSize);
-        const auto res = fi_mr_reg(_domain->_domain.get(), _message.get(), _options._frameSize, FI_SEND, 0, _key++, 0,
-                                   makeOutPointer(_memoryRegion), nullptr);
+        message_       = std::make_unique<char[]>(options_.frame_size);
+        const auto res = fi_mr_reg(domain_->domain_.get(),
+                                   message_.get(),
+                                   options_.frame_size,
+                                   FI_SEND,
+                                   0,
+                                   domain_->next_mr_key++,
+                                   0,
+                                   make_out_pointer(memory_region_),
+                                   nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_mr_reg", res};
         }
     }
 
-    void sendLoop()
+    void send_loop()
     {
         using namespace std::chrono;
-        auto nextTimePoint = steady_clock::now() + milliseconds{_options._intervalMs};
-        unsigned numMessageSent = 0;
+        auto     next_time_point  = steady_clock::now() + milliseconds{options_.interval_ms};
+        unsigned num_message_sent = 0;
 
         unsigned attempts = 0;
-        _domain->_executionCtx->addProgressable(_progressable);
+        domain_->execution_ctx_->add_progressable(progressable_);
 
-        while (!_stopped)
+        while (!stopped_)
         {
-            ssize_t result = fi_send(_endpoint->_endpoint.get(), _message.get(), _options._frameSize,
-                                     fi_mr_desc(_memoryRegion.get()), _addrVector, nullptr);
+            ssize_t result = fi_send(endpoint_->endpoint_.get(),
+                                     message_.get(),
+                                     options_.frame_size,
+                                     fi_mr_desc(memory_region_.get()),
+                                     addr_vector_,
+                                     nullptr);
             if (result == 0)
             {
-                _domain->_executionCtx->postWork(_progressable, 1);
+                domain_->execution_ctx_->post_work(progressable_, 1);
                 attempts = 0;
             }
             else
             {
-                DEBUG_LOG("fi_send result: %zd", result);
+                LOG_DEBUG("fi_send result: %zd", result);
             }
 
             if (result == -FI_EAGAIN)
@@ -395,7 +406,7 @@ private:
                 attempts++;
                 if (attempts > 100)
                 {
-                    DEBUG_LOG("fi_send: EAGAIN");
+                    LOG_DEBUG("fi_send: EAGAIN");
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -406,142 +417,142 @@ private:
                 break;
             }
 
-            CompletionEntry cqe;
-            const bool gotEntry = _completionQueue.wait_dequeue_timed(cqe, 1'000 * 2000); // 200 ms
-            if (!gotEntry)
+            completion_entry cqe;
+            const bool       got_entry = completion_queue_.wait_dequeue_timed(cqe, 1'000 * 2000);
+            if (!got_entry)
             {
-                DEBUG_LOG("Timeout waiting for completion");
+                LOG_DEBUG("Timeout waiting for completion");
                 break;
             }
-            if (cqe.errorCode == 0xDEAD)
+            if (cqe.error_code == 0xDEAD)
             {
-                DEBUG_LOG("Received EOS entry");
+                LOG_DEBUG("Received EOS entry");
                 break;
             }
-            else if (cqe.errorCode != 0)
+            else if (cqe.error_code != 0)
             {
-                DEBUG_LOG("Error on send: %s (%d)", fi_strerror(cqe.errorCode), cqe.errorCode);
+                LOG_DEBUG("Error on send: %s (%d)", fi_strerror(cqe.error_code), cqe.error_code);
                 break;
             }
-            else if (_options._verbose)
+            else if (options_.verbose)
             {
-                ++numMessageSent;
-                DEBUG_LOG("Sent completed: %u [f=%lu l=%zu]", numMessageSent, cqe.flags, cqe.length);
+                ++num_message_sent;
+                LOG_DEBUG(
+                    "Sent completed: %u [f=%lu l=%zu]", num_message_sent, cqe.flags, cqe.length);
             }
-    
-            if (_options._intervalMs > 0)
+
+            if (options_.interval_ms > 0)
             {
-                std::this_thread::sleep_until(nextTimePoint);
-                nextTimePoint = nextTimePoint + milliseconds{_options._intervalMs};
+                std::this_thread::sleep_until(next_time_point);
+                next_time_point = next_time_point + milliseconds{options_.interval_ms};
             }
         }
 
-        _domain->_executionCtx->removeProgressable(_progressable);
+        domain_->execution_ctx_->remove_progressable(progressable_);
     }
 
 private:
-    asio::io_context& _ctx;
-    asio::ip::tcp::socket _socket;
-    const AppOptions _options;
+    asio::io_context&     ctx_;
+    asio::ip::tcp::socket socket_;
+    const app_options     options_;
 
-    asio::streambuf _dynamicBuf;
+    asio::streambuf dynamic_buf_;
 
-    std::shared_ptr<EfaDomain> _domain;
+    std::shared_ptr<efa_domain> domain_;
 
-    fi_addr_t _addrVector;
+    fi_addr_t addr_vector_;
 
-    struct CompletionEntry
+    struct completion_entry
     {
-        int errorCode;
+        int      error_code;
         uint64_t flags;
-        size_t length;
+        size_t   length;
     };
-    moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
-    struct Progressable : EfaProgressable
+    moodycamel::BlockingConcurrentQueue<completion_entry> completion_queue_;
+
+    struct progressable : efa_progressable
     {
-        Progressable(fid_cq& in_cq, moodycamel::BlockingConcurrentQueue<CompletionEntry>& in_queue)
-            : _completionQueue(in_cq),
-              _completionEntryQueue(in_queue)
+        progressable(fid_cq& cq, moodycamel::BlockingConcurrentQueue<completion_entry>& queue) :
+            cq_(cq),
+            completion_queue_(queue)
         {
         }
 
-        fid_cq& _completionQueue;
-        moodycamel::BlockingConcurrentQueue<CompletionEntry>& _completionEntryQueue;
+        fid_cq&                                                cq_;
+        moodycamel::BlockingConcurrentQueue<completion_entry>& completion_queue_;
 
-        void onCompletion(uint64_t flags, size_t length) noexcept override
+        void on_completion(uint64_t flags, size_t length) noexcept override
         {
-            _completionEntryQueue.enqueue(CompletionEntry{0, flags, length});
+            completion_queue_.enqueue(completion_entry{0, flags, length});
         }
 
-        void onError(int errorCode) noexcept override
+        void on_error(int error_code) noexcept override
         {
-            _completionEntryQueue.enqueue(CompletionEntry{errorCode, 0, 0});
+            completion_queue_.enqueue(completion_entry{error_code, 0, 0});
         }
 
-        fid_cq& getCompletionQueue() const override
-        {
-            return _completionQueue;
-        }
+        fid_cq& completion_queue() const override { return cq_; }
     };
 
-    std::unique_ptr<char[]> _message;
-    std::unique_ptr<fid_mr> _memoryRegion;
-    std::shared_ptr<EfaEndpoint> _endpoint;
-    std::shared_ptr<Progressable> _progressable;
-    std::thread _sendingThread;
+    std::unique_ptr<char[]>       message_;
+    std::unique_ptr<fid_mr>       memory_region_;
+    std::shared_ptr<efa_endpoint> endpoint_;
+    std::shared_ptr<progressable> progressable_;
+    std::thread                   sending_thread_;
 
-    bool _accepted = false;
+    bool accepted_ = false;
 
-    static std::atomic<uint64_t> _key;
-    std::atomic<bool> _stopped = false;
+    static std::atomic<uint64_t> key_;
+    std::atomic<bool>            stopped_ = false;
 };
 
-std::atomic<uint64_t> Peer::_key{1};
+std::atomic<uint64_t> peer::key_{1};
 
-class App : public std::enable_shared_from_this<App>
+class app : public std::enable_shared_from_this<app>
 {
 public:
-    App(AppOptions options, asio::io_context& ctx)
-        : _options{std::move(options)},
-          _ctx{ctx},
-          _acceptor{_ctx}
-    {}
+    app(app_options options, asio::io_context& ctx) :
+        options_{std::move(options)},
+        ctx_{ctx},
+        acceptor_{ctx_}
+    {
+    }
 
     void start()
     {
-        // TODO: go through all fi_info (->next) and create EfaAdapter from all of them
-        std::shared_ptr<fi_info> hints = createFabricInfoHintsRdm("");
-        std::shared_ptr<fi_info> fabricInfo;
-        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(fabricInfo));
-        if (res != 0 || !fabricInfo)
+        std::shared_ptr<fi_info> hints = create_fabric_info_hints_rdm(options_.provider_name);
+        std::shared_ptr<fi_info> fabric_info;
+        int                      res = fi_getinfo(
+            FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), make_out_pointer(fabric_info));
+        if (res != 0 || !fabric_info)
         {
             throw rdma_error{"fi_getinfo", res};
         }
-        DEBUG_LOG("Provider: %s", fabricInfo->fabric_attr->prov_name);
-        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*fabricInfo).c_str());
+        LOG_DEBUG("Provider: %s", fabric_info->fabric_attr->prov_name);
+        LOG_DEBUG("Fabric address: %s", get_fabric_local_address_as_string(*fabric_info).c_str());
 
-        _fabric = std::make_shared<EfaFabric>(std::move(fabricInfo));
-        _domains.reserve(_options._numDomains);
-        for (int i = 0; i < _options._numDomains; ++i)
+        fabric_ = std::make_shared<efa_fabric>(std::move(fabric_info));
+        domains_.reserve(options_.num_domains);
+        for (int i = 0; i < options_.num_domains; ++i)
         {
-            _domains.push_back(std::make_shared<EfaDomain>(_fabric));
+            domains_.push_back(std::make_shared<efa_domain>(fabric_));
         }
 
-        _acceptor.open(asio::ip::tcp::v4());
-        _acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        _acceptor.bind({asio::ip::tcp::v4(), _options._port});
-        _acceptor.listen();
-        acceptNext();
+        acceptor_.open(asio::ip::tcp::v4());
+        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
+        acceptor_.bind({asio::ip::tcp::v4(), options_.port});
+        acceptor_.listen();
+        accept_next();
     }
 
     void stop()
     {
-        _stopped = true;
-        _acceptor.cancel();
-        for (auto& peer : _peers)
+        stopped_ = true;
+        acceptor_.cancel();
+        for (auto& peer_ptr : peers_)
         {
-            if (auto p = peer.lock())
+            if (auto p = peer_ptr.lock())
             {
                 p->stop();
             }
@@ -549,56 +560,56 @@ public:
     }
 
 private:
-    void acceptNext()
+    void accept_next()
     {
-        _acceptor.async_accept([this](std::error_code ec, asio::ip::tcp::socket socket) {
-            if (_stopped)
+        acceptor_.async_accept([this](std::error_code ec, asio::ip::tcp::socket socket) {
+            if (stopped_)
             {
                 return;
             }
 
             if (!ec)
             {
-                auto peer = std::make_shared<Peer>(
-                    _ctx, std::move(socket), _domains[_currentDomain], _options);
-                _currentDomain = (_currentDomain + 1) % _options._numDomains;
-                _peers.push_back(peer);
-                peer->start();
+                auto peer_ptr = std::make_shared<peer>(
+                    ctx_, std::move(socket), domains_[current_domain_], options_);
+                current_domain_ = (current_domain_ + 1) % options_.num_domains;
+                peers_.push_back(peer_ptr);
+                peer_ptr->start();
             }
 
-            acceptNext();
+            accept_next();
         });
     }
 
 private:
-    const AppOptions _options;
-    asio::io_context& _ctx;
-    asio::ip::tcp::acceptor _acceptor;
-    std::vector<std::weak_ptr<Peer>> _peers;
-    std::shared_ptr<EfaFabric> _fabric;
-    std::vector<std::shared_ptr<EfaDomain>> _domains;
-    int _currentDomain = 0;
-    bool _stopped = false;
+    const app_options                        options_;
+    asio::io_context&                        ctx_;
+    asio::ip::tcp::acceptor                  acceptor_;
+    std::vector<std::weak_ptr<peer>>         peers_;
+    std::shared_ptr<efa_fabric>              fabric_;
+    std::vector<std::shared_ptr<efa_domain>> domains_;
+    int                                      current_domain_ = 0;
+    bool                                     stopped_        = false;
 };
 
 int main(int argc, char* argv[])
 {
     setenv("FI_UNIVERSE_SIZE", "4", 1);
     setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 1);
-    
-    AppOptions options;
+
+    app_options options;
 
     int opt;
     while ((opt = getopt(argc, argv, "B:p:vs:N:t:")) != -1)
     {
         switch (opt)
         {
-        case 'B': options._port = (uint16_t)std::atoi(optarg); break;
-        case 'p': options._providerName = optarg; break;
-        case 'v': options._verbose = true; break;
-        case 's': options._frameSize = (unsigned)std::atoi(optarg); break;
-        case 't': options._intervalMs = std::atoi(optarg); break;
-        case 'N': options._numDomains = std::atoi(optarg); break;
+        case 'B': options.port = (uint16_t)std::atoi(optarg); break;
+        case 'p': options.provider_name = optarg; break;
+        case 'v': options.verbose = true; break;
+        case 's': options.frame_size = (unsigned)std::atoi(optarg); break;
+        case 't': options.interval_ms = std::atoi(optarg); break;
+        case 'N': options.num_domains = std::atoi(optarg); break;
         case '?': std::fprintf(stderr, "Unknown option: %c\n", opt); return 1;
         default:  return 1;
         }
@@ -607,18 +618,16 @@ int main(int argc, char* argv[])
     try
     {
         asio::io_context ctx;
-        App app{options, ctx};
+        app              app_instance{options, ctx};
 
         asio::signal_set signals{ctx};
         signals.add(SIGINT);
 #if defined(SIGBREAK)
         signals.add(SIBREAK);
 #endif
-        signals.async_wait([&](const std::error_code&, int) {
-            app.stop();
-        });
+        signals.async_wait([&](const std::error_code&, int) { app_instance.stop(); });
 
-        app.start();
+        app_instance.start();
         ctx.run();
     }
     catch (const std::exception& ex)

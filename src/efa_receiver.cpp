@@ -1,6 +1,6 @@
-#include "rdma_types.h"
-#include "rdma_defs.h"
 #include "getopt.h"
+#include "rdma_defs.h"
+#include "rdma_types.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -15,8 +15,8 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/address.hpp>
 #include <asio/ip/tcp.hpp>
-#include <asio/signal_set.hpp>
 #include <asio/read.hpp>
+#include <asio/signal_set.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/write.hpp>
 
@@ -28,8 +28,8 @@
 #include <sys/types.h>
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -47,32 +47,31 @@
 #include <utility>
 #include <vector>
 
-struct AppOptions
+struct app_options
 {
-    std::string _deviceAddress{""};
-    std::string _address{""};
-    std::uint16_t _port{16002};
-    std::string _providerName{""};
-    std::uint32_t _frameSize{1920 * 1080 * 8 / 3}; // Full HD v210
-    std::string _flowId{};
-    int _numMessages{100};
-    int _numReceivers{1};
-    int _numDomains{1};
-    bool _verbose{false};
+    std::string   device_address{""};
+    std::string   address{""};
+    std::uint16_t port{16002};
+    std::string   provider_name{""};
+    std::uint32_t frame_size{1920 * 1080 * 8 / 3};
+    std::string   flow_id{};
+    int           num_messages{100};
+    int           num_receivers{1};
+    int           num_domains{1};
+    bool          verbose{false};
 };
 
-template <int Name>
-class BaseTimeoutOption
+template <int NameVal>
+class base_timeout_option
 {
 public:
-    explicit BaseTimeoutOption(std::chrono::milliseconds timeout)
-        : _timeout{}
+    explicit base_timeout_option(std::chrono::milliseconds timeout)
     {
 #if defined(_WIN32)
-        _timeout = (uint32_t)timeout.count();
+        timeout_ = (uint32_t)timeout.count();
 #else
-        _timeout.tv_sec = (long)(std::chrono::duration_cast<std::chrono::seconds>(timeout).count());
-        _timeout.tv_usec = (long)(timeout.count() % 1000);
+        timeout_.tv_sec = (long)(std::chrono::duration_cast<std::chrono::seconds>(timeout).count());
+        timeout_.tv_usec = (long)(timeout.count() % 1000);
 #endif
     }
 
@@ -85,342 +84,350 @@ public:
     template <typename Protocol>
     int name(const Protocol&) const
     {
-        return Name;
+        return NameVal;
     }
 
     template <typename Protocol>
     const void* data(const Protocol&) const
     {
-        return &_timeout;
+        return &timeout_;
     }
 
     template <typename Protocol>
     std::size_t size(const Protocol&) const
     {
-        return sizeof(_timeout);
+        return sizeof(timeout_);
     }
 
 private:
 #if defined(_WIN32)
-    uint32_t _timeout;
+    uint32_t timeout_;
 #else
-    struct timeval _timeout;
+    struct timeval timeout_;
 #endif
 };
 
-using SendTimeoutOption = BaseTimeoutOption<SO_SNDTIMEO>;
-using RecvTimeoutOption = BaseTimeoutOption<SO_RCVTIMEO>;
+using send_timeout_option = base_timeout_option<SO_SNDTIMEO>;
+using recv_timeout_option = base_timeout_option<SO_RCVTIMEO>;
 
-class App : public std::enable_shared_from_this<App>
+class app : public std::enable_shared_from_this<app>
 {
 public:
-    App(AppOptions options, asio::io_context& ctx, std::shared_ptr<EfaDomain> domain)
-        : _options{std::move(options)},
-          _ctx{ctx},
-          _domain{std::move(domain)}
+    app(app_options options, asio::io_context& ctx, std::shared_ptr<efa_domain> domain) :
+        options_{std::move(options)},
+        ctx_{ctx},
+        domain_{std::move(domain)}
     {
-
     }
 
     void start()
     {
-        _endpoint = std::make_shared<EfaEndpoint>(_domain);
-        _progressable = std::make_shared<Progressable>(*_endpoint->_completionQueue, _completionQueue);
+        endpoint_ = std::make_shared<efa_endpoint>(domain_);
+        progressable_ =
+            std::make_shared<progressable>(*endpoint_->completion_queue_, completion_queue_);
 
-        char addrBytes[128] = {};
-        size_t addrLen = sizeof(addrBytes);
-        int res = fi_getname(toFid(_endpoint->_endpoint), addrBytes, &addrLen);
+        char   addr_bytes[128] = {};
+        size_t addr_len        = sizeof(addr_bytes);
+        int    res             = fi_getname(to_fid(endpoint_->endpoint_), addr_bytes, &addr_len);
         if (res != 0)
         {
             throw rdma_error{"fi_getname", res};
         }
-        char sourceAddrBytes[128];
+        char source_addr_bytes[128];
 
-        // Parse device address if provided, if not use the same as our local address (assuming localhost)
-        if ( _options._deviceAddress.empty() )
+        if (options_.device_address.empty())
         {
-            std::memcpy(sourceAddrBytes, addrBytes, addrLen);
+            std::memcpy(source_addr_bytes, addr_bytes, addr_len);
         }
         else
         {
-            if (!parseFabricAddress( _options._deviceAddress, _domain->_fabric->_fabricInfo->addr_format, sourceAddrBytes, sizeof(sourceAddrBytes)))
+            if (!parse_fabric_address(options_.device_address,
+                                      domain_->fabric_->fabric_info_->addr_format,
+                                      source_addr_bytes,
+                                      sizeof(source_addr_bytes)))
             {
-                throw rdma_error{"parseFabricAddress", -FI_EINVAL};
+                throw rdma_error{"parse_fabric_address", -FI_EINVAL};
             }
         }
 
-        uint64_t mrKey = 1;
         for (int i = 0; i < 2; ++i)
         {
-            _frames[i]._payload = std::make_unique<char[]>(_options._frameSize);
+            frames_[i].payload = std::make_unique<char[]>(options_.frame_size);
 
-            res = fi_mr_reg(_domain->_domain.get(), _frames[i]._payload.get(), _options._frameSize, FI_SEND, 0,
-                            mrKey++, 0, makeOutPointer(_frames[i]._memoryRegion), nullptr);
+            res = fi_mr_reg(domain_->domain_.get(),
+                            frames_[i].payload.get(),
+                            options_.frame_size,
+                            FI_SEND,
+                            0,
+                            domain_->next_mr_key++,
+                            0,
+                            make_out_pointer(frames_[i].memory_region),
+                            nullptr);
             if (res != 0)
             {
                 throw rdma_error{"fi_mr_reg", res};
             }
 
-            ssize_t result = fi_recv(_endpoint->_endpoint.get(), _frames[i]._payload.get(), _options._frameSize,
-                                     fi_mr_desc(_frames[i]._memoryRegion.get()), FI_ADDR_UNSPEC, nullptr);
+            ssize_t result = fi_recv(endpoint_->endpoint_.get(),
+                                     frames_[i].payload.get(),
+                                     options_.frame_size,
+                                     fi_mr_desc(frames_[i].memory_region.get()),
+                                     FI_ADDR_UNSPEC,
+                                     nullptr);
             if (result != 0)
             {
                 throw rdma_error{"fi_recv", static_cast<int>(result)};
             }
         }
 
-        asio::ip::tcp::endpoint senderEp{asio::ip::make_address(_options._address), _options._port};
-        asio::ip::tcp::socket socket{_ctx, asio::ip::tcp::v4()};
-        socket.set_option(SendTimeoutOption{std::chrono::milliseconds(1000)});
-        socket.set_option(RecvTimeoutOption{std::chrono::milliseconds(1000)});
+        asio::ip::tcp::endpoint sender_ep{asio::ip::make_address(options_.address), options_.port};
+        asio::ip::tcp::socket   socket{ctx_, asio::ip::tcp::v4()};
+        socket.set_option(send_timeout_option{std::chrono::milliseconds(1000)});
+        socket.set_option(recv_timeout_option{std::chrono::milliseconds(1000)});
         socket.set_option(asio::ip::tcp::no_delay(true));
 
-        socket.connect(senderEp);
+        socket.connect(sender_ep);
 
-        EfaClientConnectV1 connectMessage;
-        EfaControlMessageHeader sendHeader;
-        sendHeader._length = sizeof(connectMessage);
-        sendHeader._type = EfaControlMessageType::CLIENT_CONNECT_V1;
-        connectMessage._addressFormat = (uint16_t)_domain->_fabric->_fabricInfo->addr_format;
-        connectMessage._addressLength = (uint16_t)addrLen;
-        if (addrLen > sizeof(connectMessage._destAddressBytes))
+        efa::client_connect_v1      connect_message;
+        efa::control_message_header send_header;
+        send_header.type               = efa::control_message_type::CLIENT_CONNECT_V1;
+        send_header.length             = sizeof(connect_message);
+        connect_message.address_format = (uint16_t)domain_->fabric_->fabric_info_->addr_format;
+        connect_message.address_length = (uint16_t)addr_len;
+        if (addr_len > sizeof(connect_message.dest_address_bytes))
         {
             throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
         }
-        memcpy(&connectMessage._destAddressBytes, addrBytes, addrLen);
-        memcpy(&connectMessage._sourceAddressBytes, sourceAddrBytes, addrLen);
-        connectMessage._wantsFrameMetadata = false;
+        memcpy(&connect_message.dest_address_bytes, addr_bytes, addr_len);
+        memcpy(&connect_message.source_address_bytes, source_addr_bytes, addr_len);
+        connect_message.wants_frame_metadata = false;
 
-        if (!_options._flowId.empty())
+        if (!options_.flow_id.empty())
         {
-            auto& fi = connectMessage._flowIdentifier;
-            (void)std::sscanf( // Dont bother validating it
-                _options._flowId.c_str(),
-                "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx%"
-                "02hhx%02hhx%02hhx%02hhx",
-                &fi[0],
-                &fi[1],
-                &fi[2],
-                &fi[3],
-                &fi[4],
-                &fi[5],
-                &fi[6],
-                &fi[7],
-                &fi[8],
-                &fi[9],
-                &fi[10],
-                &fi[11],
-                &fi[12],
-                &fi[13],
-                &fi[14],
-                &fi[15]);
+            auto& fi = connect_message.flow_id;
+            (void)std::sscanf(options_.flow_id.c_str(),
+                              "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%"
+                              "02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
+                              &fi[0],
+                              &fi[1],
+                              &fi[2],
+                              &fi[3],
+                              &fi[4],
+                              &fi[5],
+                              &fi[6],
+                              &fi[7],
+                              &fi[8],
+                              &fi[9],
+                              &fi[10],
+                              &fi[11],
+                              &fi[12],
+                              &fi[13],
+                              &fi[14],
+                              &fi[15]);
         }
 
-        std::array<asio::const_buffer, 2> sendBufs = {
-            asio::buffer(&sendHeader, sizeof(sendHeader)),
-            asio::buffer(&connectMessage, sizeof(connectMessage))
-        };
-        asio::write(socket, sendBufs);
+        std::array<asio::const_buffer, 2> send_buffs = {
+            asio::buffer(&send_header, sizeof(send_header)),
+            asio::buffer(&connect_message, sizeof(connect_message))};
+        asio::write(socket, send_buffs);
 
-        EfaControlMessageHeader receiveHeader;
-        size_t n = asio::read(socket, asio::buffer(&receiveHeader, sizeof(receiveHeader)));
-        if (n != sizeof(EfaControlMessageHeader))
+        efa::control_message_header receive_header;
+        size_t n = asio::read(socket, asio::buffer(&receive_header, sizeof(receive_header)));
+        if (n != sizeof(efa::control_message_header))
         {
             throw std::runtime_error{"Failed to read response header"};
         }
 
-        if (receiveHeader._protocolVersion != PROTOCOL_VERSION)
+        if (receive_header.protocol_version != PROTOCOL_VERSION)
         {
             throw std::runtime_error{"Invalid protocol version"};
         }
-        if (receiveHeader._type != EfaControlMessageType::SERVER_REJECT_V1 &&
-            receiveHeader._type != EfaControlMessageType::SERVER_ACCEPT_V1)
+        if (receive_header.type != efa::control_message_type::SERVER_REJECT_V1 &&
+            receive_header.type != efa::control_message_type::SERVER_ACCEPT_V1)
         {
             throw std::runtime_error{
                 "Invalid control message type, expected SERVER_REJECT or SERVER_ACCEPT"};
         }
 
-        if (receiveHeader._type == EfaControlMessageType::SERVER_REJECT_V1)
+        if (receive_header.type == efa::control_message_type::SERVER_REJECT_V1)
         {
-            assert( receiveHeader._length == sizeof(EfaServerRejectV1) );
-            EfaServerRejectV1 rejectMessage;
-            n = asio::read(socket, asio::buffer(&rejectMessage, sizeof(EfaServerRejectV1)));
-            if (n != sizeof(EfaServerRejectV1))
+            assert(receive_header.length == sizeof(efa::server_reject_v1));
+            efa::server_reject_v1 reject_message;
+            n = asio::read(socket, asio::buffer(&reject_message, sizeof(efa::server_reject_v1)));
+            if (n != sizeof(efa::server_reject_v1))
             {
-                throw std::runtime_error{"Failed to read EfaServerRejectV1 payload"};
+                throw std::runtime_error{"Failed to read server_reject_v1 payload"};
             }
-            throw std::runtime_error{"Connection rejected: " + std::string(rejectMessage._errorMessage)};
+            throw std::runtime_error{"Connection rejected: " +
+                                     std::string(reject_message.error_message)};
         }
-        else if (receiveHeader._type == EfaControlMessageType::SERVER_ACCEPT_V1)
+        else if (receive_header.type == efa::control_message_type::SERVER_ACCEPT_V1)
         {
-            assert( receiveHeader._length == sizeof(EfaServerAcceptV1) );
-            EfaServerAcceptV1 acceptMessage;
-            n = asio::read(socket, asio::buffer(&acceptMessage, sizeof(EfaServerAcceptV1)));
-            if (n != sizeof(EfaServerAcceptV1))
+            assert(receive_header.length == sizeof(efa::server_accept_v1));
+            efa::server_accept_v1 accept_message;
+            n = asio::read(socket, asio::buffer(&accept_message, sizeof(efa::server_accept_v1)));
+            if (n != sizeof(efa::server_accept_v1))
             {
-                throw std::runtime_error{"Failed to read acceptMessage payload"};
+                throw std::runtime_error{"Failed to read accept_message payload"};
             }
 
-            DEBUG_LOG("Connection accepted:\n  accept time: %lu\n  frame size: %u\n  metadata size: "
-                      "%u\n  has active producers: %u",
-                      acceptMessage._acceptConnectionTime,
-                      acceptMessage._frameSize,
-                      acceptMessage._frameMetadataSize,
-                      acceptMessage._hasActiveProducers);
+            LOG_DEBUG("Connection accepted:\n  accept time: %lu\n  frame size: %u\n  metadata "
+                      "size: %u\n  has active producers: %u",
+                      accept_message.accept_connection_time,
+                      accept_message.frame_size,
+                      accept_message.frame_metadata_size,
+                      accept_message.has_active_producers);
 
-            if (acceptMessage._frameSize != _options._frameSize)
+            if (accept_message.frame_size != options_.frame_size)
             {
-                EfaClientShutdownV1 shutdownMessage;
-                sendHeader._length = sizeof(shutdownMessage);
-                sendHeader._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
-                sendBufs = {
-                    asio::buffer(&sendHeader, sizeof(sendHeader)),
-                    asio::buffer(&shutdownMessage, sizeof(shutdownMessage))
-                };
-                asio::write(socket, sendBufs);
+                efa::client_shutdown_v1 shutdown_message;
+                send_header.length = sizeof(shutdown_message);
+                send_header.type   = efa::control_message_type::CLIENT_SHUTDOWN_V1;
+                send_buffs         = {asio::buffer(&send_header, sizeof(send_header)),
+                                      asio::buffer(&shutdown_message, sizeof(shutdown_message))};
+                asio::write(socket, send_buffs);
                 socket.close();
                 throw std::runtime_error{"Invalid frame size"};
             }
-            DEBUG_LOG("Connection accepted");
         }
 
-        _domain->_executionCtx->addProgressable(_progressable);
-        _domain->_executionCtx->postWork(_progressable, 2);
+        domain_->execution_ctx_->add_progressable(progressable_);
+        domain_->execution_ctx_->post_work(progressable_, 2);
 
         try
         {
-            receiveLoop();
+            receive_loop();
         }
-        catch ( ... )
+        catch (...)
         {
-
-            _domain->_executionCtx->removeProgressable(_progressable);
+            domain_->execution_ctx_->remove_progressable(progressable_);
             throw;
         }
 
-        receiveLoop();
-        DEBUG_LOG("Sending shutdown");
+        LOG_DEBUG("Sending shutdown");
 
-        EfaClientShutdownV1 shutdownMessage;
-        sendHeader._length = sizeof(shutdownMessage);
-        sendHeader._type = EfaControlMessageType::CLIENT_SHUTDOWN_V1;
-        sendBufs = {
-            asio::buffer(&sendHeader, sizeof(sendHeader)),
-            asio::buffer(&shutdownMessage, sizeof(shutdownMessage))
-        };
-        asio::write(socket, sendBufs);
+        efa::client_shutdown_v1 shutdown_message;
+        send_header.length = sizeof(shutdown_message);
+        send_header.type   = efa::control_message_type::CLIENT_SHUTDOWN_V1;
+        send_buffs         = {asio::buffer(&send_header, sizeof(send_header)),
+                              asio::buffer(&shutdown_message, sizeof(shutdown_message))};
+        asio::write(socket, send_buffs);
         socket.close();
 
-        _domain->_executionCtx->removeProgressable(_progressable);
+        domain_->execution_ctx_->remove_progressable(progressable_);
 
-        // This flushes all unsend/received data, we need buffers/mrs to be alive
-        _endpoint.reset();
+        endpoint_.reset();
 
-        for (auto& frame : _frames)
+        for (auto& frame : frames_)
         {
-            frame._memoryRegion.reset();
-            frame._payload.reset();
+            frame.memory_region.reset();
+            frame.payload.reset();
         }
     }
 
     void stop()
     {
-        _stopped = true;
-        _completionQueue.enqueue(CompletionEntry{0xDEAD, 0, 0});
+        stopped_ = true;
+        completion_queue_.enqueue(completion_entry{0xDEAD, 0, 0});
     }
 
 private:
-    void receiveLoop()
+    void receive_loop()
     {
-        unsigned frameToRepost = 1;
-        unsigned numMessageReceived = 0;
+        unsigned frame_to_repost      = 1;
+        unsigned num_message_received = 0;
 
-        while (!_stopped)
+        while (!stopped_)
         {
-            // Wait on completion
-            CompletionEntry entry;
-            const bool gotEntry = _completionQueue.wait_dequeue_timed(entry, 1'000 * 2000); // 200 ms
-            if (!gotEntry)
+            completion_entry entry;
+            const bool       got_entry = completion_queue_.wait_dequeue_timed(entry, 1'000 * 2000);
+            if (!got_entry)
             {
-                DEBUG_LOG("Timeout waiting for completion");
+                LOG_DEBUG("Timeout waiting for completion");
                 break;
             }
-            if (entry.errorCode == 0xDEAD) // EOS entry
+            if (entry.error_code == 0xDEAD)
             {
                 break;
             }
 
-            ssize_t result = fi_recv(_endpoint->_endpoint.get(), _frames[frameToRepost]._payload.get(), _options._frameSize,
-                                     fi_mr_desc(_frames[frameToRepost]._memoryRegion.get()), FI_ADDR_UNSPEC, nullptr);
+            ssize_t result = fi_recv(endpoint_->endpoint_.get(),
+                                     frames_[frame_to_repost].payload.get(),
+                                     options_.frame_size,
+                                     fi_mr_desc(frames_[frame_to_repost].memory_region.get()),
+                                     FI_ADDR_UNSPEC,
+                                     nullptr);
             if (result != 0)
             {
                 throw rdma_error{"fi_recv", static_cast<int>(result)};
             }
-            _domain->_executionCtx->postWork(_progressable, 1);
-            frameToRepost = 1 - frameToRepost;
+            domain_->execution_ctx_->post_work(progressable_, 1);
+            frame_to_repost = 1 - frame_to_repost;
 
-            ++numMessageReceived;
-            if (_options._verbose)
-                DEBUG_LOG("Received: %u (%zu bytes)", numMessageReceived, entry.len);
-            if (_options._numMessages > 0 && numMessageReceived >= (unsigned)_options._numMessages)
+            ++num_message_received;
+            if (options_.verbose)
             {
-                DEBUG_LOG("Received %u messages, stopping", numMessageReceived);
+                LOG_DEBUG("Received: %u (%zu bytes)", num_message_received, entry.len);
+            }
+            if (options_.num_messages > 0 &&
+                num_message_received >= (unsigned)options_.num_messages)
+            {
+                LOG_DEBUG("Received %u messages, stopping", num_message_received);
                 break;
             }
         }
     }
 
 private:
-    const AppOptions _options;
-    asio::io_context& _ctx;
-    const std::shared_ptr<EfaDomain> _domain;
+    const app_options                 options_;
+    asio::io_context&                 ctx_;
+    const std::shared_ptr<efa_domain> domain_;
 
-    struct CompletionEntry
+    struct completion_entry
     {
-        int errorCode;
+        int      error_code;
         uint64_t flags;
-        size_t len;
+        size_t   len;
     };
-    moodycamel::BlockingConcurrentQueue<CompletionEntry> _completionQueue;
 
-    struct Progressable : EfaProgressable
+    moodycamel::BlockingConcurrentQueue<completion_entry> completion_queue_;
+
+    struct progressable : efa_progressable
     {
-        Progressable(fid_cq& in_cq, moodycamel::BlockingConcurrentQueue<CompletionEntry>& in_queue)
-            : _completionQueue(in_cq),
-              _completionEntryQueue(in_queue)
+        progressable(fid_cq& cq, moodycamel::BlockingConcurrentQueue<completion_entry>& queue) :
+            completion_queue_(cq),
+            completion_entry_queue_(queue)
         {
         }
 
-        fid_cq& _completionQueue;
-        moodycamel::BlockingConcurrentQueue<CompletionEntry>& _completionEntryQueue;
+        fid_cq&                                                completion_queue_;
+        moodycamel::BlockingConcurrentQueue<completion_entry>& completion_entry_queue_;
 
-        void onCompletion(uint64_t flags, size_t length) noexcept override
+        void on_completion(uint64_t flags, size_t length) noexcept override
         {
-            _completionEntryQueue.enqueue(CompletionEntry{0, flags, length});
+            completion_entry_queue_.enqueue(completion_entry{0, flags, length});
         }
 
-        void onError(int errorCode) noexcept override
+        void on_error(int error_code) noexcept override
         {
-            _completionEntryQueue.enqueue(CompletionEntry{errorCode, 0, 0});
+            completion_entry_queue_.enqueue(completion_entry{error_code, 0, 0});
         }
 
-        fid_cq& getCompletionQueue() const override
-        {
-            return _completionQueue;
-        }
+        fid_cq& completion_queue() const override { return completion_queue_; }
     };
 
-    struct Frame
+    struct frame
     {
-        std::unique_ptr<fid_mr> _memoryRegion;
-        std::unique_ptr<char[]> _payload;
+        std::unique_ptr<fid_mr> memory_region;
+        std::unique_ptr<char[]> payload;
     };
-    Frame _frames[2];
 
-    std::shared_ptr<EfaEndpoint> _endpoint;
-    std::shared_ptr<Progressable> _progressable;
+    frame frames_[2];
 
-    std::atomic<bool> _stopped = false;
+    std::shared_ptr<efa_endpoint> endpoint_;
+    std::shared_ptr<progressable> progressable_;
+
+    std::atomic<bool> stopped_ = false;
 };
 
 int main(int argc, char* argv[])
@@ -428,29 +435,29 @@ int main(int argc, char* argv[])
     setenv("FI_UNIVERSE_SIZE", "4", 1);
     setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 1);
 
-    AppOptions options;
+    app_options options;
 
     int opt;
     while ((opt = getopt(argc, argv, "d:a:B:p:n:r:f:s:N:v")) != -1)
     {
         switch (opt)
         {
-        case 'd': options._deviceAddress = optarg; break;
-        case 'a': options._address = optarg; break;
-        case 'B': options._port = (uint16_t)std::atoi(optarg); break;
-        case 'p': options._providerName = optarg; break;
-        case 'n': options._numMessages = std::atoi(optarg); break;
-        case 'r': options._numReceivers = std::atoi(optarg); break;
-        case 'f': options._flowId = optarg; break;
-        case 's': options._frameSize = std::atoi(optarg); break;
-        case 'N': options._numDomains = std::atoi(optarg); break;
-        case 'v': options._verbose = true; break;
+        case 'd': options.device_address = optarg; break;
+        case 'a': options.address = optarg; break;
+        case 'B': options.port = (uint16_t)std::atoi(optarg); break;
+        case 'p': options.provider_name = optarg; break;
+        case 'n': options.num_messages = std::atoi(optarg); break;
+        case 'r': options.num_receivers = std::atoi(optarg); break;
+        case 'f': options.flow_id = optarg; break;
+        case 's': options.frame_size = std::atoi(optarg); break;
+        case 'N': options.num_domains = std::atoi(optarg); break;
+        case 'v': options.verbose = true; break;
         case '?': std::fprintf(stderr, "Unknown option: %c\n", opt); return 1;
         default:  return 1;
         }
     }
 
-    if (options._address.empty())
+    if (options.address.empty())
     {
         std::fprintf(stderr, "Address (-a) is required\n");
         return 1;
@@ -460,13 +467,13 @@ int main(int argc, char* argv[])
     {
         asio::io_context ctx;
 
-        struct Bundle
+        struct bundle
         {
-            std::unique_ptr<App> app;
-            std::thread thread;
+            std::unique_ptr<app> app_ptr;
+            std::thread          thread;
         };
 
-        std::vector<std::unique_ptr<Bundle>> bundles;
+        std::vector<std::unique_ptr<bundle>> bundles;
 
         asio::signal_set signals{ctx};
         signals.add(SIGINT);
@@ -475,63 +482,69 @@ int main(int argc, char* argv[])
 #endif
         signals.async_wait([&](const std::error_code&, int) {
             for (auto& b : bundles)
-                b->app->stop();
+            {
+                b->app_ptr->stop();
+            }
         });
 
-        std::vector<int> finished(options._numReceivers, 0);
-        std::mutex finishedMutex;
+        std::vector<int> finished(options.num_receivers, 0);
+        std::mutex       finished_mutex;
 
-        // TODO: go through all fi_info (->next) and create EfaAdapter from all of them
-        std::shared_ptr<fi_info> hints = createFabricInfoHintsRdm("");
-        std::shared_ptr<fi_info> fabricInfo;
-        int res = fi_getinfo(FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), makeOutPointer(fabricInfo));
-        if (res != 0 || !fabricInfo)
+        std::shared_ptr<fi_info> hints = create_fabric_info_hints_rdm(options.provider_name);
+        std::shared_ptr<fi_info> fabric_info;
+        int                      res = fi_getinfo(
+            FABRIC_VERSION, nullptr, nullptr, 0U, hints.get(), make_out_pointer(fabric_info));
+        if (res != 0 || !fabric_info)
         {
             throw rdma_error{"fi_getinfo", res};
         }
-        DEBUG_LOG("Provider: %s", fabricInfo->fabric_attr->prov_name);
-        DEBUG_LOG("Fabric address: %s", getFabricLocalAddressAsString(*fabricInfo).c_str());
+        LOG_DEBUG("Provider: %s", fabric_info->fabric_attr->prov_name);
+        LOG_DEBUG("Fabric address: %s", get_fabric_local_address_as_string(*fabric_info).c_str());
 
-        std::shared_ptr<EfaFabric> fabric = std::make_shared<EfaFabric>(std::move(fabricInfo));
-        std::vector<std::shared_ptr<EfaDomain>> domains;
-        for (int i = 0; i < options._numDomains; ++i)
+        std::shared_ptr<efa_fabric> fabric = std::make_shared<efa_fabric>(std::move(fabric_info));
+        std::vector<std::shared_ptr<efa_domain>> domains;
+        for (int i = 0; i < options.num_domains; ++i)
         {
-            domains.push_back(std::make_shared<EfaDomain>(fabric));
+            domains.push_back(std::make_shared<efa_domain>(fabric));
         }
 
-        for (int i = 0, d = 0; i < options._numReceivers; ++i)
+        for (int i = 0, d = 0; i < options.num_receivers; ++i)
         {
-            auto bundle = std::make_unique<Bundle>();
-            DEBUG_LOG("CREATING APP [%d] with DOMAIN [%d]", i, d);
-            bundle->app = std::make_unique<App>(options, ctx, domains[d]);
-            d = (d + 1) % options._numDomains;
-            bundle->thread = std::thread{[self = bundle->app.get(), i, &finishedMutex, &finished, &ctx]() mutable {
-                try
-                {
-                    self->start();
-                }
-                catch (const std::exception& ex)
-                {
-                    DEBUG_LOG("EXCEPTION on receiver[%d]: %s", i, ex.what());
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock{finishedMutex};
-                    finished[i] = 1;
-                    if (std::all_of(finished.begin(), finished.end(), [](int f) { return f == 1; }))
+            auto bundle_ptr = std::make_unique<bundle>();
+            LOG_DEBUG("CREATING APP [%d] with DOMAIN [%d]", i, d);
+            bundle_ptr->app_ptr = std::make_unique<app>(options, ctx, domains[d]);
+            d                   = (d + 1) % options.num_domains;
+            bundle_ptr->thread  = std::thread{
+                [self = bundle_ptr->app_ptr.get(), i, &finished_mutex, &finished, &ctx]() mutable {
+                    try
                     {
-                        DEBUG_LOG("All receivers finished, stopping context");
-                        ctx.stop();
+                        self->start();
                     }
-                }
-            }};
-            bundles.push_back(std::move(bundle));
+                    catch (const std::exception& ex)
+                    {
+                        LOG_DEBUG("EXCEPTION on receiver[%d]: %s", i, ex.what());
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock{finished_mutex};
+                        finished[i] = 1;
+                        if (std::all_of(
+                                finished.begin(), finished.end(), [](int f) { return f == 1; }))
+                        {
+                            LOG_DEBUG("All receivers finished, stopping context");
+                            ctx.stop();
+                        }
+                    }
+                }};
+            bundles.push_back(std::move(bundle_ptr));
         }
 
         ctx.run();
 
         for (auto& b : bundles)
+        {
             b->thread.join();
+        }
     }
     catch (const std::exception& ex)
     {
