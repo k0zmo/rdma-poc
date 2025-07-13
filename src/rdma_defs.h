@@ -2,6 +2,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
 
 struct client_connection
 {
@@ -72,6 +75,7 @@ enum class control_message_type : std::uint8_t
 {
     UNKNOWN,
     CLIENT_CONNECT_V1,
+    CLIENT_CONNECT_RDMA_V1,
     CLIENT_SHUTDOWN_V1,
     SERVER_ACCEPT_V1,
     SERVER_REJECT_V1
@@ -84,6 +88,25 @@ struct control_message_header
     std::uint16_t         length           = 0;
 };
 
+enum class transmit_mode : std::uint8_t
+{
+    SEND_RECV,
+    RDMA_WRITE
+};
+
+inline transmit_mode transmit_mode_from_string(const char* mode)
+{
+    if (!std::strcmp(mode, "sendrecv"))
+    {
+        return transmit_mode::SEND_RECV;
+    }
+    else if (!std::strcmp(mode, "rdmawrite"))
+    {
+        return transmit_mode::RDMA_WRITE;
+    }
+    throw std::invalid_argument{"Invalid transmit mode: " + std::string(mode)};
+}
+
 struct client_connect_v1
 {
     std::uint16_t address_format           = 0;
@@ -92,6 +115,39 @@ struct client_connect_v1
     std::uint8_t  dest_address_bytes[64]   = {};
     std::uint8_t  flow_id[16]              = {};
     bool          wants_frame_metadata     = true;
+};
+
+struct mr_info
+{
+    std::uint64_t address = 0;
+    std::uint64_t size    = 0;
+    std::uint64_t rkey    = 0;
+};
+
+struct client_connect_rdma_v1 : client_connect_v1
+{
+    std::uint32_t num_mr;
+
+    const mr_info* get_mr(std::uint32_t index) const
+    {
+        if (index >= num_mr)
+        {
+            return nullptr; // Invalid index
+        }
+        return reinterpret_cast<const mr_info*>(reinterpret_cast<const char*>(this) +
+                                                sizeof(client_connect_rdma_v1) +
+                                                index * sizeof(mr_info));
+    }
+
+    mr_info* get_mr(std::uint32_t index)
+    {
+        if (index >= num_mr)
+        {
+            return nullptr; // Invalid index
+        }
+        return reinterpret_cast<mr_info*>(reinterpret_cast<char*>(this) +
+                                          sizeof(client_connect_rdma_v1) + index * sizeof(mr_info));
+    }
 };
 
 struct client_shutdown_v1

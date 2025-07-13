@@ -49,16 +49,19 @@
 
 struct app_options
 {
-    std::string   device_address{""};
-    std::string   address{""};
-    std::uint16_t port{16002};
-    std::string   provider_name{""};
-    std::uint32_t frame_size{1920 * 1080 * 8 / 3};
-    std::string   flow_id{};
-    int           num_messages{100};
-    int           num_receivers{1};
-    int           num_domains{1};
-    bool          verbose{false};
+    std::string        device_address{""};
+    std::string        address{""};
+    std::uint16_t      port{16002};
+    std::string        provider_name{""};
+    std::uint32_t      frame_size{1920 * 1080 * 8 / 3};
+    std::string        flow_id{};
+    efa::transmit_mode transmit_mode{efa::transmit_mode::SEND_RECV};
+    int                num_messages{100};
+    int                num_receivers{1};
+    int                num_domains{1};
+    bool               verbose{false};
+
+    bool is_rdma() const { return transmit_mode == efa::transmit_mode::RDMA_WRITE; }
 };
 
 template <int NameVal>
@@ -126,35 +129,11 @@ public:
         progressable_ =
             std::make_shared<progressable>(*endpoint_->completion_queue_, completion_queue_);
 
-        char   addr_bytes[128] = {};
-        size_t addr_len        = sizeof(addr_bytes);
-        int    res             = fi_getname(to_fid(endpoint_->endpoint_), addr_bytes, &addr_len);
-        if (res != 0)
-        {
-            throw rdma_error{"fi_getname", res};
-        }
-        char source_addr_bytes[128];
-
-        if (options_.device_address.empty())
-        {
-            std::memcpy(source_addr_bytes, addr_bytes, addr_len);
-        }
-        else
-        {
-            if (!parse_fabric_address(options_.device_address,
-                                      domain_->fabric_->fabric_info_->addr_format,
-                                      source_addr_bytes,
-                                      sizeof(source_addr_bytes)))
-            {
-                throw rdma_error{"parse_fabric_address", -FI_EINVAL};
-            }
-        }
-
         for (int i = 0; i < 2; ++i)
         {
             frames_[i].payload = std::make_unique<char[]>(options_.frame_size);
 
-            res = fi_mr_reg(domain_->domain_.get(),
+            int res = fi_mr_reg(domain_->domain_.get(),
                             frames_[i].payload.get(),
                             options_.frame_size,
                             FI_SEND,
@@ -168,15 +147,18 @@ public:
                 throw rdma_error{"fi_mr_reg", res};
             }
 
-            ssize_t result = fi_recv(endpoint_->endpoint_.get(),
-                                     frames_[i].payload.get(),
-                                     options_.frame_size,
-                                     fi_mr_desc(frames_[i].memory_region.get()),
-                                     FI_ADDR_UNSPEC,
-                                     nullptr);
-            if (result != 0)
+            if (!options_.is_rdma())
             {
-                throw rdma_error{"fi_recv", static_cast<int>(result)};
+                ssize_t result = fi_recv(endpoint_->endpoint_.get(),
+                                         frames_[i].payload.get(),
+                                         options_.frame_size,
+                                         fi_mr_desc(frames_[i].memory_region.get()),
+                                         FI_ADDR_UNSPEC,
+                                         nullptr);
+                if (result != 0)
+                {
+                    throw rdma_error{"fi_recv", static_cast<int>(result)};
+                }
             }
         }
 
@@ -188,48 +170,46 @@ public:
 
         socket.connect(sender_ep);
 
-        efa::client_connect_v1      connect_message;
-        efa::control_message_header send_header;
-        send_header.type               = efa::control_message_type::CLIENT_CONNECT_V1;
-        send_header.length             = sizeof(connect_message);
-        connect_message.address_format = (uint16_t)domain_->fabric_->fabric_info_->addr_format;
-        connect_message.address_length = (uint16_t)addr_len;
-        if (addr_len > sizeof(connect_message.dest_address_bytes))
+        if (options_.is_rdma())
         {
-            throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
-        }
-        memcpy(&connect_message.dest_address_bytes, addr_bytes, addr_len);
-        memcpy(&connect_message.source_address_bytes, source_addr_bytes, addr_len);
-        connect_message.wants_frame_metadata = false;
+            std::unique_ptr<char[]> message = std::make_unique<char[]>(sizeof(efa::client_connect_rdma_v1) +
+                                                                        2 * sizeof(efa::mr_info));
+            efa::client_connect_rdma_v1* connect_message = new (message.get()) efa::client_connect_rdma_v1;
+            connect_message->num_mr      = 2;
+            for (auto i = 0U; i < connect_message->num_mr; ++i)
+            {
+                *connect_message->get_mr(i) =
+                    efa::mr_info{/*.address = */(std::uint64_t)frames_[i].payload.get(),
+                                 /*.size    = */options_.frame_size,
+                                 /*.rkey    = */frames_[i].memory_region->key};
+            }
+            initialize_connect_message(*connect_message);
 
-        if (!options_.flow_id.empty())
+            efa::control_message_header send_header;
+            send_header.type   = efa::control_message_type::CLIENT_CONNECT_RDMA_V1;
+            send_header.length = sizeof(*connect_message) + connect_message->num_mr * sizeof(efa::mr_info);
+
+            std::array<asio::const_buffer, 2> send_buffs = {
+                asio::buffer(&send_header, sizeof(send_header)),
+                asio::buffer(&connect_message, send_header.length)};
+            asio::write(socket, send_buffs);
+
+            connect_message->~client_connect_rdma_v1(); // Call destructor to clean up
+        }
+        else
         {
-            auto& fi = connect_message.flow_id;
-            (void)std::sscanf(options_.flow_id.c_str(),
-                              "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%"
-                              "02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
-                              &fi[0],
-                              &fi[1],
-                              &fi[2],
-                              &fi[3],
-                              &fi[4],
-                              &fi[5],
-                              &fi[6],
-                              &fi[7],
-                              &fi[8],
-                              &fi[9],
-                              &fi[10],
-                              &fi[11],
-                              &fi[12],
-                              &fi[13],
-                              &fi[14],
-                              &fi[15]);
-        }
+            efa::client_connect_v1 connect_message;
+            initialize_connect_message(connect_message);
 
-        std::array<asio::const_buffer, 2> send_buffs = {
-            asio::buffer(&send_header, sizeof(send_header)),
-            asio::buffer(&connect_message, sizeof(connect_message))};
-        asio::write(socket, send_buffs);
+            efa::control_message_header send_header;
+            send_header.type   = efa::control_message_type::CLIENT_CONNECT_V1;
+            send_header.length = sizeof(connect_message);
+
+            std::array<asio::const_buffer, 2> send_buffs = {
+                asio::buffer(&send_header, sizeof(send_header)),
+                asio::buffer(&connect_message, send_header.length)};
+            asio::write(socket, send_buffs);
+        }
 
         efa::control_message_header receive_header;
         size_t n = asio::read(socket, asio::buffer(&receive_header, sizeof(receive_header)));
@@ -281,10 +261,12 @@ public:
             if (accept_message.frame_size != options_.frame_size)
             {
                 efa::client_shutdown_v1 shutdown_message;
+                efa::control_message_header send_header;
                 send_header.length = sizeof(shutdown_message);
                 send_header.type   = efa::control_message_type::CLIENT_SHUTDOWN_V1;
-                send_buffs         = {asio::buffer(&send_header, sizeof(send_header)),
-                                      asio::buffer(&shutdown_message, sizeof(shutdown_message))};
+                std::array<asio::const_buffer, 2> send_buffs = {
+                    asio::buffer(&send_header, sizeof(send_header)),
+                    asio::buffer(&shutdown_message, send_header.length)};
                 asio::write(socket, send_buffs);
                 socket.close();
                 throw std::runtime_error{"Invalid frame size"};
@@ -307,10 +289,12 @@ public:
         LOG_DEBUG("Sending shutdown");
 
         efa::client_shutdown_v1 shutdown_message;
+        efa::control_message_header send_header;
         send_header.length = sizeof(shutdown_message);
         send_header.type   = efa::control_message_type::CLIENT_SHUTDOWN_V1;
-        send_buffs         = {asio::buffer(&send_header, sizeof(send_header)),
-                              asio::buffer(&shutdown_message, sizeof(shutdown_message))};
+        std::array<asio::const_buffer, 2> send_buffs = {
+            asio::buffer(&send_header, sizeof(send_header)),
+            asio::buffer(&shutdown_message, send_header.length)};
         asio::write(socket, send_buffs);
         socket.close();
 
@@ -332,6 +316,68 @@ public:
     }
 
 private:
+    template <typename ConnectMessage>
+    void initialize_connect_message(ConnectMessage& connect_message)
+    {
+        char   addr_bytes[128] = {};
+        size_t addr_len        = sizeof(addr_bytes);
+        int    res             = fi_getname(to_fid(endpoint_->endpoint_), addr_bytes, &addr_len);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_getname", res};
+        }
+        char source_addr_bytes[128];
+
+        if (options_.device_address.empty())
+        {
+            std::memcpy(source_addr_bytes, addr_bytes, addr_len);
+        }
+        else
+        {
+            if (!parse_fabric_address(options_.device_address,
+                                      domain_->fabric_->fabric_info_->addr_format,
+                                      source_addr_bytes,
+                                      sizeof(source_addr_bytes)))
+            {
+                throw rdma_error{"parse_fabric_address", -FI_EINVAL};
+            }
+        }
+
+        connect_message.address_format = (uint16_t)domain_->fabric_->fabric_info_->addr_format;
+        connect_message.address_length = (uint16_t)addr_len;
+        if (addr_len > sizeof(connect_message.dest_address_bytes))
+        {
+            throw std::runtime_error{"Fabric address length is too big for V1 protocol"};
+        }
+        memcpy(&connect_message.dest_address_bytes, addr_bytes, addr_len);
+        memcpy(&connect_message.source_address_bytes, source_addr_bytes, addr_len);
+        connect_message.wants_frame_metadata = false;
+
+        if (!options_.flow_id.empty())
+        {
+            auto& fi = connect_message.flow_id;
+            (void)std::sscanf(options_.flow_id.c_str(),
+                              "%02hhx%02hhx%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%02hhx%02hhx-%"
+                              "02hhx%02hhx%02hhx%02hhx%02hhx%02hhx",
+                              &fi[0],
+                              &fi[1],
+                              &fi[2],
+                              &fi[3],
+                              &fi[4],
+                              &fi[5],
+                              &fi[6],
+                              &fi[7],
+                              &fi[8],
+                              &fi[9],
+                              &fi[10],
+                              &fi[11],
+                              &fi[12],
+                              &fi[13],
+                              &fi[14],
+                              &fi[15]);
+        }
+    }
+
     void receive_loop()
     {
         unsigned frame_to_repost      = 1;
@@ -438,7 +484,7 @@ int main(int argc, char* argv[])
     app_options options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:a:B:p:n:r:f:s:N:v")) != -1)
+    while ((opt = getopt(argc, argv, "d:a:B:p:n:r:f:s:N:t:v")) != -1)
     {
         switch (opt)
         {
@@ -451,6 +497,7 @@ int main(int argc, char* argv[])
         case 'f': options.flow_id = optarg; break;
         case 's': options.frame_size = std::atoi(optarg); break;
         case 'N': options.num_domains = std::atoi(optarg); break;
+        case 't': options.transmit_mode = efa::transmit_mode_from_string(optarg); break;
         case 'v': options.verbose = true; break;
         case '?': std::fprintf(stderr, "Unknown option: %c\n", opt); return 1;
         default:  return 1;

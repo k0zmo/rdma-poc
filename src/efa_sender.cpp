@@ -311,10 +311,12 @@ private:
         case efa::control_message_type::SERVER_ACCEPT_V1:
         case efa::control_message_type::SERVER_REJECT_V1:
             LOG_DEBUG("Invalid control message: %hu, closing connection", (uint16_t)header.type);
+            stop();
             return;
         default:
             LOG_DEBUG("Unsupported control message: %hu, skipping", (uint16_t)header.type);
-            break;
+            stop();
+            return;
         }
 
         asio::async_read(socket_,
