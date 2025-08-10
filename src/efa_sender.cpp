@@ -174,7 +174,7 @@ private:
         efa::control_message_header header;
         header.type                           = efa::control_message_type::SERVER_ACCEPT_V1;
         header.length                         = sizeof(accept_message);
-        accept_message.accept_connection_time = 1111111;
+        accept_message.accept_connection_time = FabricClock::now().time_since_epoch().count();
         accept_message.frame_size             = options_.frame_size;
         accept_message.frame_metadata_size    = 0;
         accept_message.has_active_producers   = true;
@@ -385,6 +385,10 @@ private:
 
         while (!stopped_)
         {
+            const std::int64_t tick = FabricClock::now().time_since_epoch().count();
+            std::memcpy(message_.get(), &num_message_sent, sizeof(num_message_sent));
+            std::memcpy(message_.get() + sizeof(num_message_sent), &tick, sizeof(tick));
+
             ssize_t result = fi_send(endpoint_->endpoint_.get(),
                                      message_.get(),
                                      options_.frame_size,
@@ -434,9 +438,10 @@ private:
                 LOG_DEBUG("Error on send: %s (%d)", fi_strerror(cqe.error_code), cqe.error_code);
                 break;
             }
-            else if (options_.verbose)
+
+            ++num_message_sent;
+            if (options_.verbose)
             {
-                ++num_message_sent;
                 LOG_DEBUG(
                     "Sent completed: %u [f=%lu l=%zu]", num_message_sent, cqe.flags, cqe.length);
             }
@@ -541,7 +546,7 @@ public:
 
         acceptor_.open(asio::ip::tcp::v4());
         acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        acceptor_.bind({asio::ip::tcp::v4(), options_.port});
+        acceptor_.bind({asio::ip::make_address("0.0.0.0"), options_.port});
         acceptor_.listen();
         accept_next();
     }

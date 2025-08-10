@@ -271,12 +271,18 @@ public:
                 throw std::runtime_error{"Failed to read accept_message payload"};
             }
 
+            const FabricClock::time_point sender_time{
+                FabricClock::duration{(std::int64_t)accept_message.accept_connection_time}};
+            const auto timeDifference = std::chrono::duration_cast<std::chrono::microseconds>(
+                                            FabricClock::now() - sender_time)
+                                            .count();
             LOG_DEBUG("Connection accepted:\n  accept time: %lu\n  frame size: %u\n  metadata "
-                      "size: %u\n  has active producers: %u",
+                      "size: %u\n  has active producers: %u\n  time difference: %f ms\n",
                       accept_message.accept_connection_time,
                       accept_message.frame_size,
                       accept_message.frame_metadata_size,
-                      accept_message.has_active_producers);
+                      accept_message.has_active_producers,
+                      timeDifference / 1000.f);
 
             if (accept_message.frame_size != options_.frame_size)
             {
@@ -334,7 +340,7 @@ public:
 private:
     void receive_loop()
     {
-        unsigned frame_to_repost      = 1;
+        unsigned frame_to_repost      = 0;
         unsigned num_message_received = 0;
 
         while (!stopped_)
@@ -350,6 +356,27 @@ private:
             {
                 break;
             }
+
+            // Validate index of message (first 4 bytes) and calculate the latency (timestamp on the
+            // sender is next 8 bytes). This assumes clocks in sender and receiver are in synced.
+            const char* data = frames_[frame_to_repost].payload.get();
+            unsigned message_index = 0;
+            std::memcpy(&message_index, data, sizeof(message_index));
+            if (message_index != num_message_received)
+            {
+                LOG_DEBUG("!! message_index(%u) != num_message_received(%u)",
+                         message_index,
+                         num_message_received);
+            }
+
+            std::int64_t sender_timestamp_tick = 0;
+            std::memcpy(&sender_timestamp_tick, data + sizeof(message_index), sizeof(sender_timestamp_tick));
+
+            const auto sender_timestamp =
+                FabricClock::time_point{FabricClock::duration{sender_timestamp_tick}};
+            const auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   FabricClock::now() - sender_timestamp)
+                                   .count();
 
             ssize_t result = fi_recv(endpoint_->endpoint_.get(),
                                      frames_[frame_to_repost].payload.get(),
@@ -367,7 +394,7 @@ private:
             ++num_message_received;
             if (options_.verbose)
             {
-                LOG_DEBUG("Received: %u (%zu bytes)", num_message_received, entry.len);
+                LOG_DEBUG("Received: %u (%zu bytes) - latency: %ld ms", num_message_received, entry.len, delta);
             }
             if (options_.num_messages > 0 &&
                 num_message_received >= (unsigned)options_.num_messages)

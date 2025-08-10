@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <ratio>
 #include <sstream>
 #include <stdexcept>
 #include <string.h>
@@ -948,3 +949,29 @@ inline std::string get_fabric_local_address_as_string(const fi_info& info)
 {
     return get_address_as_string(info.src_addr, info.addr_format);
 }
+
+struct FabricClock
+{
+    using rep = std::int64_t;
+    using period = std::ratio<1, 108'000'000>;
+    using duration = std::chrono::duration<rep, period>;
+    using time_point  = std::chrono::time_point<FabricClock>;
+    static constexpr bool is_steady = false;
+
+    static time_point now() noexcept
+    {
+        using namespace std::chrono;
+
+        // We offset system_clock (UTC) by 37 seconds (TAI offset).
+        static constexpr seconds tai_offset{37};
+
+        // To avoid overflowing (especially on Linux where duration is in nanoseconds),
+        // convert the system_clock time_point/duration to 100*ns unit (Windows "native" unit)
+        // and only then to FabricClock clock unit.
+        const auto now_tai = system_clock::now().time_since_epoch() + tai_offset;
+        using duration100ns = std::chrono::duration<std::int64_t, std::ratio<1, 10'000'000>>;
+        return time_point{
+            duration_cast<duration>(
+                duration_cast<duration100ns>(now_tai))};
+    }
+};
