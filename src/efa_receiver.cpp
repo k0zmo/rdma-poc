@@ -157,7 +157,7 @@ public:
             res = fi_mr_reg(domain_->domain_.get(),
                             frames_[i].payload.get(),
                             options_.frame_size,
-                            FI_SEND,
+                            FI_RECV,
                             0,
                             domain_->next_mr_key++,
                             0,
@@ -352,8 +352,12 @@ private:
                 LOG_DEBUG("Timeout waiting for completion");
                 break;
             }
-            if (entry.error_code == 0xDEAD)
+            if (entry.error_code != 0)
             {
+                if (entry.error_code != 0xDEAD)
+                {
+                    LOG_DEBUG("Received error completion - code: %d (%s)", entry.error_code, fi_strerror(entry.error_code));
+                }
                 break;
             }
 
