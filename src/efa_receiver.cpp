@@ -396,6 +396,10 @@ private:
             {
                 LOG_DEBUG("Received: %u (%zu bytes) - latency: %ld ms", num_message_received, entry.len, delta);
             }
+            else if (num_message_received % 100 == 0)
+            {
+                LOG_DEBUG("Received: %u (%zu bytes) - latency: %ld ms", num_message_received, entry.len, delta);
+            }
             if (options_.num_messages > 0 &&
                 num_message_received >= (unsigned)options_.num_messages)
             {
