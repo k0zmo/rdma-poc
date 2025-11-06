@@ -27,6 +27,11 @@ struct client_connection_flow_v1b : client_connection_flow_v1
     bool wants_frame_metadata = true;
 };
 
+struct client_connection_flow_v1c : client_connection_flow_v1b
+{
+    std::uint64_t max_chunk_size = std::uint64_t(-1);
+};
+
 struct server_connection_flow_v1
 {
     /// Size (in bytes) of the frame the server will send.
@@ -44,6 +49,11 @@ struct server_connection_flow_v1b : server_connection_flow_v1
 {
     /// Size (in bytes) of the frame metadata the server will send.
     std::uint32_t frame_metadata_size = 0;
+};
+
+struct server_connection_flow_v1c : server_connection_flow_v1b
+{
+    std::uint64_t max_chunk_size = std::uint64_t(-1);
 };
 
 inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_REPEATED = 1 << 0;

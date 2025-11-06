@@ -25,12 +25,14 @@
 #  include <ws2tcpip.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -43,6 +45,7 @@ struct app_options
     std::string   port{"8001"};
     std::string   provider_name{"verbs"};
     std::uint32_t frame_size{5 * 1024 * 1024}; // 5MB
+    std::uint64_t max_chunk_size{std::numeric_limits<std::uint64_t>::max()};
     int           interval_ms{20};
     bool          verbose{false};
 };
@@ -55,7 +58,7 @@ enum class wait_result
     TIMEOUT
 };
 
-void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
+void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const client_connection_flow_v1c& client_data)
 {
     static constexpr std::chrono::milliseconds ACCEPT_TIMEOUT        = std::chrono::seconds{2};
     static constexpr std::chrono::milliseconds INITIAL_RECV_TIMEOUT  = std::chrono::seconds{2};
@@ -84,11 +87,14 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
 
     endpoint.receive_empty_message();
 
-    server_connection_flow_v1b server_data{};
+    const auto max_chunk_size = std::min(cfg.max_chunk_size, client_data.max_chunk_size);
+
+    server_connection_flow_v1c server_data{};
     server_data.frame_size             = cfg.frame_size;
-    server_data.accept_connection_time = 1111111;
+    server_data.accept_connection_time = FabricClock::now().time_since_epoch().count();
     server_data.has_active_producers   = true;
     server_data.frame_metadata_size    = 0;
+    server_data.max_chunk_size         = max_chunk_size;
     res = fi_accept(endpoint.endpoint_.get(), &server_data, sizeof(server_data));
     if (res != 0)
     {
@@ -145,24 +151,38 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
 
     using namespace std::chrono;
     auto next_time_point = steady_clock::now() + milliseconds{cfg.interval_ms};
+    const unsigned num_chunks     = max_chunk_size == std::numeric_limits<uint64_t>::max()
+                                        ? 1
+                                        : (message_size + max_chunk_size - 1) / max_chunk_size;
+    std::cout << "Number of chunks per message: " << num_chunks << std::endl;
 
     while (true)
     {
         endpoint.receive_empty_message();
 
-        ret = fi_send(endpoint.endpoint_.get(),
-                      buf.get(),
-                      message_size,
-                      fi_mr_desc(memory_region.get()),
-                      FI_ADDR_UNSPEC,
-                      nullptr);
-        if (ret != 0)
+        uint64_t       remaining_size = message_size;
+        uint64_t       offset         = 0;
+        while (remaining_size > 0)
         {
-            throw rdma_error{"fi_recv", static_cast<int>(ret)};
+            const auto chunk_size = std::min(remaining_size, max_chunk_size);
+            ret = fi_send(endpoint.endpoint_.get(),
+                          buf.get() + offset,
+                          chunk_size,
+                          fi_mr_desc(memory_region.get()),
+                          FI_ADDR_UNSPEC,
+                          nullptr);
+            if (ret != 0)
+            {
+                throw rdma_error{"fi_send", static_cast<int>(ret)};
+            }
+
+            remaining_size -= chunk_size;
+            offset += chunk_size;
         }
 
         wait_result  wr                  = wait_result::TIMEOUT;
-        bool         next_recv_completed = false, send_completed = false;
+        bool         next_recv_completed = false;
+        unsigned     num_send_completed  = 0;
         milliseconds send_timeout = SEND_TIMEOUT;
 
         while (send_timeout.count() > 0)
@@ -177,7 +197,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
             {
                 if ((entry.flags & SEND_COMPLETION_FLAGS) == SEND_COMPLETION_FLAGS)
                 {
-                    send_completed = true;
+                    num_send_completed += 1;
                 }
                 else if ((entry.flags & RECV_COMPLETION_FLAGS) == RECV_COMPLETION_FLAGS)
                 {
@@ -186,7 +206,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg)
 
                 // Both send and receive were completed, we sent the message and the client is ready
                 // for the next message
-                if (send_completed && next_recv_completed)
+                if (num_send_completed == num_chunks && next_recv_completed)
                 {
                     wr = wait_result::SENT_MESSAGE;
                     break;
@@ -275,10 +295,10 @@ void run(const app_options& cfg)
     rdma_adapter            adapter{std::move(fabric_info)};
     rdma_listening_endpoint listening_endpoint{adapter};
 
-    const auto entry_max_size =
-        listening_endpoint.max_connection_data_size() + sizeof(fi_eq_cm_entry);
-    std::unique_ptr<uint8_t[]> connet_buffer = std::make_unique<uint8_t[]>(entry_max_size);
-    fi_eq_cm_entry*            entry = reinterpret_cast<fi_eq_cm_entry*>(connet_buffer.get());
+    const auto max_connection_data_size       = listening_endpoint.max_connection_data_size();
+    const auto entry_max_size                 = max_connection_data_size + sizeof(fi_eq_cm_entry);
+    std::unique_ptr<uint8_t[]> connect_buffer = std::make_unique<uint8_t[]>(entry_max_size);
+    fi_eq_cm_entry*            entry = reinterpret_cast<fi_eq_cm_entry*>(connect_buffer.get());
     uint32_t                   event = 0;
 
     while (true)
@@ -354,24 +374,12 @@ void run(const app_options& cfg)
             {
                 if (connection_data_size >= sizeof(client_connection_flow_v1))
                 {
-                    client_connection_flow_v1b client_connection_v1{};
-                    if (connection_data_size >= sizeof(client_connection_flow_v1b))
-                    {
-                        std::memcpy(
-                            &client_connection_v1, entry->data, sizeof(client_connection_flow_v1b));
-                    }
-                    else
-                    {
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic push
-#  pragma GCC diagnostic ignored "-Wclass-memaccess"
-#endif
-                        std::memcpy(
-                            &client_connection_v1, entry->data, sizeof(client_connection_flow_v1));
-#if defined(__GNUC__) && !defined(__clang__)
-#  pragma GCC diagnostic pop
-#endif
-                    }
+                    client_connection_flow_v1c client_connection_v1{};
+                    client_connection_v1.wants_frame_metadata = false;
+
+                    std::memcpy(&client_connection_v1,
+                                entry->data,
+                                std::min(sizeof(client_connection_flow_v1c), connection_data_size));
 
                     char flow_id[32 + 4 + 1];
                     std::sprintf(
@@ -396,16 +404,22 @@ void run(const app_options& cfg)
 
                     std::cout << "Connection data:"
                               << "\n  Flow identifier: " << flow_id
-                              << "\n  Wants metadata: " << std::boolalpha
-                              << client_connection_v1.wants_frame_metadata << std::endl;
+                              << "\n  Wants metadata: " << std::boolalpha << client_connection_v1.wants_frame_metadata
+                              << "\n  Chunk size: " << client_connection_v1.max_chunk_size
+                              << std::endl;
 
-                    if (!std::strcmp(flow_id, "e569f502-8891-4c9f-92d4-51702b158bd5"))
+                    const bool older_receiver = connection_data_size < sizeof(client_connection_flow_v1c);
+                    if (older_receiver && cfg.max_chunk_size != std::numeric_limits<uint64_t>::max())
+                    {
+                        error_message_stream << "No max_chunk_size support, rejected";
+                    }
+                    else if (!std::strcmp(flow_id, "e569f502-8891-4c9f-92d4-51702b158bd5"))
                     {
                         try
                         {
                             std::thread th{
-                                [ep = rdma_endpoint{adapter, *entry->info}, cfg]() mutable -> void {
-                                    handle_connection(ep, cfg);
+                                [ep = rdma_endpoint{adapter, *entry->info}, cfg, client_connection_v1]() mutable -> void {
+                                    handle_connection(ep, cfg, client_connection_v1);
                                 }};
                             th.detach();
                         }
@@ -439,9 +453,9 @@ void run(const app_options& cfg)
             if (!error_message.empty())
             {
                 std::cout << "Connection rejected: " << error_message << std::endl;
-                if (error_message.size() > entry_max_size - 1)
+                if (error_message.size() > max_connection_data_size - 1)
                 {
-                    error_message.resize(entry_max_size - 1);
+                    error_message.resize(max_connection_data_size - 1);
                 }
                 fi_reject(listening_endpoint.passive_endpoint_.get(),
                           entry->info->handle,
@@ -463,7 +477,7 @@ int main(int argc, char* argv[])
     app_options options;
 
     int opt;
-    while ((opt = getopt(argc, argv, "a:B:p:s:t:v")) != -1)
+    while ((opt = getopt(argc, argv, "a:B:p:s:t:c:v")) != -1)
     {
         switch (opt)
         {
@@ -472,6 +486,7 @@ int main(int argc, char* argv[])
         case 'p': options.provider_name = optarg; break;
         case 's': options.frame_size = (unsigned)std::atoi(optarg); break;
         case 't': options.interval_ms = std::atoi(optarg); break;
+        case 'c': options.max_chunk_size = (unsigned)std::atoi(optarg); break;
         case 'v': options.verbose = true; break;
         case '?': std::cerr << "Unknown option: " << char(optopt) << std::endl; return 1;
         default:  return 1;
@@ -486,6 +501,16 @@ int main(int argc, char* argv[])
 
     try
     {
+        // Print current options
+        std::cout << "Current options:" << std::endl;
+        std::cout << "  Address: " << options.address << std::endl;
+        std::cout << "  Port: " << options.port << std::endl;
+        std::cout << "  Provider: " << options.provider_name << std::endl;
+        std::cout << "  Frame size: " << options.frame_size << std::endl;
+        std::cout << "  Max chunk size: " << options.max_chunk_size << std::endl;
+        std::cout << "  Interval (ms): " << options.interval_ms << std::endl;
+        std::cout << "  Verbose: " << std::boolalpha << options.verbose << std::endl;
+
         run(options);
     }
     catch (const std::exception& ex)

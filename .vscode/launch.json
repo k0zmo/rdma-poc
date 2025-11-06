@@ -8,7 +8,7 @@
             "type": "lldb",
             "request": "attach",
             "name": "Attach",
-            "program": "${workspaceFolder}/build/Linux-GCC-Debug/efa_sender"
+            "program": "${workspaceFolder}/build/old/receiver"
         },
         {
             "type": "lldb",
