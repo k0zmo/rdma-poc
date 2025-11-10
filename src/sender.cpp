@@ -85,7 +85,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
         throw rdma_error{"fi_mr_reg", res};
     }
 
-    endpoint.receive_empty_message();
+    endpoint.receive_sync_message();
 
     const auto max_chunk_size = std::min(cfg.max_chunk_size, client_data.max_chunk_size);
 
@@ -158,7 +158,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
 
     while (true)
     {
-        endpoint.receive_empty_message();
+        endpoint.receive_sync_message();
 
         uint64_t       remaining_size = message_size;
         uint64_t       offset         = 0;

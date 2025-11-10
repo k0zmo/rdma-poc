@@ -139,7 +139,7 @@ void handle_connected(rdma_endpoint& endpoint, const server_connection_flow_v1c&
             remaining_size -= chunk_size;
             offset += chunk_size;
         }
-        endpoint.send_empty_message();
+        endpoint.send_sync_message();
 
         wait_result  wait_result             = wait_result::TIMEOUT;
         bool         send_completed          = false;

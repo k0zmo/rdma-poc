@@ -365,6 +365,12 @@ struct rdma_endpoint
     std::unique_ptr<fid_cq> completion_queue_;
     std::unique_ptr<fid_ep> endpoint_; // must be before EQ and CQ
 
+private:
+    static constexpr std::uint32_t sync_message_size = 32;
+    std::unique_ptr<char[]> sync_buf_;
+    std::unique_ptr<fid_mr> sync_mr_;
+
+public:
     explicit rdma_endpoint(const rdma_adapter& adapter) :
         rdma_endpoint(adapter, *adapter.fabric_info_)
     {
@@ -422,18 +428,20 @@ struct rdma_endpoint
         }
     }
 
-    void receive_empty_message()
+    void receive_sync_message()
     {
-        ssize_t res = fi_recv(endpoint_.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
+        ensure_sync_buffer_allocated(FI_RECV);
+        ssize_t res = fi_recv(endpoint_.get(), sync_buf_.get(), sync_message_size, fi_mr_desc(sync_mr_.get()), FI_ADDR_UNSPEC, nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_recv", static_cast<int>(res)};
         }
     }
 
-    void send_empty_message()
+    void send_sync_message()
     {
-        ssize_t res = fi_send(endpoint_.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
+        ensure_sync_buffer_allocated(FI_SEND);
+        ssize_t res = fi_send(endpoint_.get(), sync_buf_.get(), sync_message_size, fi_mr_desc(sync_mr_.get()), FI_ADDR_UNSPEC, nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_send", static_cast<int>(res)};
@@ -451,6 +459,30 @@ struct rdma_endpoint
             throw rdma_error{"fi_getopt", res};
         }
         return value;
+    }
+
+private:
+    void ensure_sync_buffer_allocated(int direction)
+    {
+        if (sync_mr_)
+        {
+            return;
+        }
+
+        sync_buf_ = std::make_unique<char[]>(sync_message_size);
+        int res   = fi_mr_reg(domain_.get(),
+                            sync_buf_.get(),
+                            sync_message_size,
+                            direction,
+                            0,
+                            0,
+                            0,
+                            make_out_pointer(sync_mr_),
+                            nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_mr_reg", res};
+        }
     }
 };
 
