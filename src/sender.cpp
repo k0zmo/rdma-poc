@@ -45,7 +45,7 @@ struct app_options
     std::string   port{"8001"};
     std::string   provider_name{"verbs"};
     std::uint32_t frame_size{5 * 1024 * 1024}; // 5MB
-    std::uint64_t max_chunk_size{std::numeric_limits<std::uint64_t>::max()};
+    std::uint32_t max_chunk_size{std::numeric_limits<std::uint32_t>::max()};
     int           interval_ms{20};
     bool          verbose{false};
 };
@@ -151,7 +151,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
 
     using namespace std::chrono;
     auto next_time_point = steady_clock::now() + milliseconds{cfg.interval_ms};
-    const unsigned num_chunks     = max_chunk_size == std::numeric_limits<uint64_t>::max()
+    const unsigned num_chunks     = max_chunk_size == std::numeric_limits<uint32_t>::max()
                                         ? 1
                                         : (message_size + max_chunk_size - 1) / max_chunk_size;
     std::cout << "Number of chunks per message: " << num_chunks << std::endl;
@@ -164,7 +164,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
         uint64_t       offset         = 0;
         while (remaining_size > 0)
         {
-            const auto chunk_size = std::min(remaining_size, max_chunk_size);
+            const auto chunk_size = std::min<uint64_t>(remaining_size, max_chunk_size);
             ret = fi_send(endpoint.endpoint_.get(),
                           buf.get() + offset,
                           chunk_size,
@@ -409,7 +409,7 @@ void run(const app_options& cfg)
                               << std::endl;
 
                     const bool older_receiver = connection_data_size < sizeof(client_connection_flow_v1c);
-                    if (older_receiver && cfg.max_chunk_size != std::numeric_limits<uint64_t>::max())
+                    if (older_receiver && cfg.max_chunk_size != std::numeric_limits<uint32_t>::max())
                     {
                         error_message_stream << "No max_chunk_size support, rejected";
                     }

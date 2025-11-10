@@ -29,7 +29,7 @@ struct client_connection_flow_v1b : client_connection_flow_v1
 
 struct client_connection_flow_v1c : client_connection_flow_v1b
 {
-    std::uint64_t max_chunk_size = std::uint64_t(-1);
+    std::uint32_t max_chunk_size = std::uint32_t(-1);
 };
 
 struct server_connection_flow_v1
@@ -40,6 +40,7 @@ struct server_connection_flow_v1
     std::uint64_t accept_connection_time = 0;
     /// At the moment of establishing connection, does the flow has active producers?
     bool has_active_producers = false;
+    std::uint32_t padding = 0;
 };
 
 /**
@@ -53,7 +54,7 @@ struct server_connection_flow_v1b : server_connection_flow_v1
 
 struct server_connection_flow_v1c : server_connection_flow_v1b
 {
-    std::uint64_t max_chunk_size = std::uint64_t(-1);
+    std::uint32_t max_chunk_size = std::uint32_t(-1);
 };
 
 inline constexpr std::uint32_t FRAME_INFORMATION_FLAG_REPEATED = 1 << 0;

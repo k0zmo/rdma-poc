@@ -40,7 +40,7 @@ struct app_options
     std::string   provider_name{"verbs"};
     std::string   local_address{};
     std::string   flow_id{};
-    std::uint64_t max_chunk_size{std::numeric_limits<std::uint64_t>::max()};
+    std::uint32_t max_chunk_size{std::numeric_limits<std::uint32_t>::max()};
     int           num_messages{100};
     int           sleep_time{0};
     bool          verbose{false};
@@ -118,14 +118,14 @@ void handle_connected(rdma_endpoint& endpoint, const server_connection_flow_v1c&
 
     while (!stopped)
     {
-        const unsigned num_chunks     = max_chunk_size == std::numeric_limits<uint64_t>::max()
+        const unsigned num_chunks     = max_chunk_size == std::numeric_limits<uint32_t>::max()
                                             ? 1
                                             : (message_size + max_chunk_size - 1) / max_chunk_size;
         uint64_t       remaining_size = message_size;
         uint64_t       offset         = 0;
         while (remaining_size > 0)
         {
-            const auto chunk_size = std::min(remaining_size, max_chunk_size);
+            const auto chunk_size = std::min<uint64_t>(remaining_size, max_chunk_size);
             ssize_t ret = fi_recv(endpoint.endpoint_.get(),
                                   buf.get() + offset,
                                   chunk_size,
