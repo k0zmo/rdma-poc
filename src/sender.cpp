@@ -122,7 +122,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
     std::cout << " - CONNECTED\n";
 
     // Wait for first signal-ready message
-    fi_cq_msg_entry entry;
+    fi_cq_data_entry entry;
     ret = fi_cq_sread(endpoint.completion_queue_.get(),
                       &entry,
                       1,
@@ -291,7 +291,7 @@ void handle_connection(rdma_endpoint& endpoint, const app_options& cfg, const cl
 
 void run(const app_options& cfg)
 {
-    auto                    fabric_info = get_fabric_info(cfg.provider_name, cfg.address, cfg.port);
+    auto                    fabric_info = get_fabric_info(cfg.provider_name, cfg.address, cfg.port, false);
     rdma_adapter            adapter{std::move(fabric_info)};
     rdma_listening_endpoint listening_endpoint{adapter};
 

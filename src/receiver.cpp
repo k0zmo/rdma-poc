@@ -152,9 +152,9 @@ void handle_connected(rdma_endpoint& endpoint, const server_connection_flow_v1c&
         while (true)
         {
             // Wait for both completions (send+recv) but no more than 2 seconds in total
-            auto            waiting_start = steady_clock::now();
-            fi_cq_msg_entry entry;
-            ssize_t         ret = fi_cq_sread(endpoint.completion_queue_.get(),
+            auto waiting_start = steady_clock::now();
+            fi_cq_data_entry entry;
+            ssize_t ret = fi_cq_sread(endpoint.completion_queue_.get(),
                                       &entry,
                                       1,
                                       nullptr,
@@ -353,7 +353,7 @@ static bool is_connection_refused(int error_code)
 
 void run(const app_options& cfg)
 {
-    auto fabric_info = get_fabric_info(cfg.provider_name, cfg.address, cfg.port, cfg.local_address);
+    auto fabric_info = get_fabric_info(cfg.provider_name, cfg.address, cfg.port, cfg.local_address, false);
     rdma_adapter  adapter{std::move(fabric_info)};
     rdma_endpoint ep{adapter};
 

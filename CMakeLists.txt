@@ -61,3 +61,18 @@ target_link_libraries(efa_receiver PRIVATE
 )
 target_compile_features(efa_sender PRIVATE cxx_std_17)
 
+add_executable(rma_writer src/rma_writer.cpp)
+target_link_libraries(rma_writer PRIVATE
+    Threads::Threads
+    libfabric::libfabric
+    "$<$<PLATFORM_ID:Windows>:getopt;ws2_32>"
+)
+target_compile_features(rma_writer PRIVATE cxx_std_17)
+
+add_executable(rma_target src/rma_target.cpp)
+target_link_libraries(rma_target PRIVATE
+    Threads::Threads
+    libfabric::libfabric
+    "$<$<PLATFORM_ID:Windows>:getopt;ws2_32>"
+)
+target_compile_features(rma_target PRIVATE cxx_std_17)

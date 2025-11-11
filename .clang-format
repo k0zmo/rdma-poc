@@ -3,10 +3,10 @@
 AccessModifierOffset: -4
 AlignAfterOpenBracket: Align
 AlignArrayOfStructures: Right
-AlignConsecutiveAssignments: Consecutive
-AlignConsecutiveBitFields: Consecutive
-AlignConsecutiveDeclarations: Consecutive
-AlignConsecutiveMacros: Consecutive
+AlignConsecutiveAssignments: None
+AlignConsecutiveBitFields: None
+AlignConsecutiveDeclarations: None
+AlignConsecutiveMacros: None
 AlignConsecutiveShortCaseStatements:
   Enabled: true
   AcrossEmptyLines: true

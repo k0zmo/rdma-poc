@@ -30,6 +30,7 @@
 #include <ratio>
 #include <sstream>
 #include <stdexcept>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <thread>
@@ -55,6 +56,24 @@
     } while (0);
 
 inline const auto FABRIC_VERSION = FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION);
+
+template<class T>
+struct aligned_deleter
+{
+    void operator()(T * data) const
+    {
+        free(data);
+    }
+};
+
+template <class T>
+std::unique_ptr<T[], aligned_deleter<T>> allocate_aligned(int alignment, int length)
+{
+    T* raw = 0;
+    int error = posix_memalign((void**)&raw, alignment, sizeof(T) * length);
+    assert(error == 0);
+    return std::unique_ptr<T[], aligned_deleter<T>>{raw};
+}
 
 // Deleter that works for any type from libfabric but fi_info
 template <typename T>
@@ -257,6 +276,48 @@ inline std::shared_ptr<fi_info> create_fabric_info_hints(const std::string& prov
     return hints;
 }
 
+inline std::shared_ptr<fi_info> create_fabric_info_hints_rma(const std::string& provider_name,
+                                                             const std::string& src_address)
+{
+    fi_info* raw_hints = fi_allocinfo();
+    if (!raw_hints)
+    {
+        throw rdma_error{"hints is null", -FI_ENOMEM};
+    }
+    std::shared_ptr<fi_info> hints{raw_hints, fi_freeinfo};
+
+    if (!provider_name.empty())
+    {
+        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
+    }
+    hints->ep_attr->type             = FI_EP_MSG;
+    hints->caps                      = FI_MSG | FI_RMA | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_WRITE;
+    hints->mode                      = FI_RX_CQ_DATA;
+    hints->domain_attr->mr_mode      = FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR;
+    hints->domain_attr->cq_data_size = 4;   
+
+    if (!src_address.empty())
+    {
+        in_addr src_addr{};
+        if (inet_pton(AF_INET, src_address.c_str(), &src_addr) == 1)
+        {
+            sockaddr_in* addr = reinterpret_cast<sockaddr_in*>(malloc(sizeof(sockaddr_in)));
+            memset(addr, 0, sizeof(sockaddr_in));
+            addr->sin_addr     = src_addr;
+            addr->sin_family   = AF_INET;
+            hints->addr_format = FI_SOCKADDR_IN;
+            hints->src_addr    = addr;
+            hints->src_addrlen = sizeof(sockaddr_in);
+        }
+        else
+        {
+            throw rdma_error{"Invalid source address", -FI_ENODATA};
+        }
+    }
+
+    return hints;
+}
+
 inline std::shared_ptr<fi_info> create_fabric_info_hints_rdm(const std::string& provider_name)
 {
     fi_info* raw_hints = fi_allocinfo();
@@ -284,9 +345,12 @@ inline std::shared_ptr<fi_info> create_fabric_info_hints_rdm(const std::string& 
 inline std::shared_ptr<fi_info> get_fabric_info(const std::string& provider_name,
                                                 const std::string& dest_address,
                                                 const std::string& dest_port,
-                                                const std::string& src_address)
+                                                const std::string& src_address,
+                                                bool is_rma_needed)
 {
-    std::shared_ptr<fi_info> hints = create_fabric_info_hints(provider_name, src_address);
+    std::shared_ptr<fi_info> hints = !is_rma_needed
+                                         ? create_fabric_info_hints(provider_name, src_address)
+                                         : create_fabric_info_hints_rma(provider_name, src_address);
     std::shared_ptr<fi_info> fabric_info;
     int res = fi_getinfo(FABRIC_VERSION,
                          dest_address.c_str(),
@@ -309,9 +373,12 @@ inline std::shared_ptr<fi_info> get_fabric_info(const std::string& provider_name
 
 inline std::shared_ptr<fi_info> get_fabric_info(const std::string& provider_name,
                                                 const std::string& src_address,
-                                                const std::string& src_port)
+                                                const std::string& src_port,
+                                                bool is_rma_needed)
 {
-    std::shared_ptr<fi_info> hints = create_fabric_info_hints(provider_name, "");
+    std::shared_ptr<fi_info> hints = !is_rma_needed
+                                         ? create_fabric_info_hints(provider_name, "")
+                                         : create_fabric_info_hints_rma(provider_name, "");
     std::shared_ptr<fi_info> fabric_info;
     int res = fi_getinfo(FABRIC_VERSION,
                          src_address.c_str(),
@@ -403,7 +470,7 @@ public:
         cq_attrs.size       = 4; // Derived from the protocol requirements
                                  // (we expect max two completions at given time) times two
         cq_attrs.wait_obj = FI_WAIT_UNSPEC;
-        cq_attrs.format   = FI_CQ_FORMAT_MSG;
+        cq_attrs.format   = FI_CQ_FORMAT_DATA;
         res = fi_cq_open(domain_.get(), &cq_attrs, make_out_pointer(completion_queue_), nullptr);
         if (res != 0)
         {
@@ -428,10 +495,24 @@ public:
         }
     }
 
+    void receive_empty_message()
+    {
+        ssize_t res = fi_recv(endpoint_.get(), nullptr, 0, nullptr, FI_ADDR_UNSPEC, nullptr);
+        if (res != 0)
+        {
+            throw rdma_error{"fi_recv", static_cast<int>(res)};
+        }
+    }
+
     void receive_sync_message()
     {
         ensure_sync_buffer_allocated(FI_RECV);
-        ssize_t res = fi_recv(endpoint_.get(), sync_buf_.get(), sync_message_size, fi_mr_desc(sync_mr_.get()), FI_ADDR_UNSPEC, nullptr);
+        ssize_t res = fi_recv(endpoint_.get(),
+                              sync_buf_.get(),
+                              sync_message_size,
+                              fi_mr_desc(sync_mr_.get()),
+                              FI_ADDR_UNSPEC,
+                              nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_recv", static_cast<int>(res)};
@@ -441,7 +522,12 @@ public:
     void send_sync_message()
     {
         ensure_sync_buffer_allocated(FI_SEND);
-        ssize_t res = fi_send(endpoint_.get(), sync_buf_.get(), sync_message_size, fi_mr_desc(sync_mr_.get()), FI_ADDR_UNSPEC, nullptr);
+        ssize_t res = fi_send(endpoint_.get(),
+                              sync_buf_.get(),
+                              sync_message_size,
+                              fi_mr_desc(sync_mr_.get()),
+                              FI_ADDR_UNSPEC,
+                              nullptr);
         if (res != 0)
         {
             throw rdma_error{"fi_send", static_cast<int>(res)};
